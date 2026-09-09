@@ -2,14 +2,19 @@ import base64
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import runpy
+import shutil
+import signal
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 import unittest
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 APP = runpy.run_path(str(Path(__file__).resolve().parents[1] / "agenttop"))
@@ -66,6 +71,480 @@ class VersionTests(unittest.TestCase):
                 with patch("subprocess.run", side_effect=FileNotFoundError):
                     APP["version"].cache_clear()
                     self.assertEqual(APP["version"](), "unknown (Git unavailable)")
+
+
+class UpdateTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="agenttop update ")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.seed = self.root / "seed"
+        self.remote = self.root / "remote.git"
+        self.client = self.root / "client"
+        isolated = patch.dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+        isolated.start()
+        self.addCleanup(isolated.stop)
+        self.git(self.root, "init", "--template=", "--initial-branch=main", str(self.seed))
+        (self.seed / "agenttop").write_text("# initial synthetic executable\n")
+        self.commit(self.seed, "Initial fixture")
+        self.git(self.root, "clone", "--bare", "--template=", str(self.seed), str(self.remote))
+        self.git(self.root, "clone", "--template=", str(self.remote), str(self.client))
+        self.before = self.git(self.client, "rev-parse", "HEAD")
+        self.git(self.seed, "remote", "add", "origin", str(self.remote))
+        self.source = self.client / "agenttop"
+        self.addCleanup(APP["version"].cache_clear)
+
+    def git(self, root, *args):
+        return subprocess.run(
+            ["git", "-C", str(root), "-c", "user.name=Test",
+             "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false",
+             *args], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    def commit(self, root, message):
+        self.git(root, "add", ".")
+        self.git(root, "commit", "-m", message,
+                 "-m", "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>")
+        return self.git(root, "rev-parse", "HEAD")
+
+    def publish(self):
+        (self.seed / "agenttop").write_text("# updated synthetic executable\n")
+        target = self.commit(self.seed, "New fixture version")
+        self.git(self.seed, "push", "origin", "main")
+        return target
+
+    def update(self, source=None):
+        output, error = io.StringIO(), io.StringIO()
+        with patch.dict(APP["update_checkout"].__globals__, __file__=str(source or self.source)):
+            APP["version"].cache_clear()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+                result = APP["update_checkout"]()
+        return result, output.getvalue(), error.getvalue()
+
+    def check_update(self, loaded_revision=None):
+        return APP["check_update"](
+            str(self.client), lambda *args: self.git(self.client, *args),
+            self.before if loaded_revision is None else loaded_revision,
+        )
+
+    def test_check_detects_available_update_without_changing_files(self):
+        target = self.publish()
+        notice = self.check_update()
+        self.assertEqual(notice.status, "available")
+        self.assertIn("agenttop -update", notice.text)
+        self.assertIn(f"r2.{target[:8]}", notice.detail)
+        self.assertEqual(self.git(self.client, "rev-parse", "HEAD"), self.before)
+        self.assertEqual(self.source.read_text(), "# initial synthetic executable\n")
+
+    def test_check_reports_current(self):
+        self.assertEqual(self.check_update().status, "current")
+
+    def test_check_distinguishes_local_ahead_from_available(self):
+        self.source.write_text("# local work\n")
+        local = self.commit(self.client, "Local revision")
+        self.assertEqual(self.check_update(local).status, "ahead")
+
+    def test_check_reports_history_rewrite_not_update(self):
+        tree = self.git(self.seed, "rev-parse", "HEAD^{tree}")
+        replacement = self.git(self.seed, "commit-tree", tree, "-m", "Unrelated synthetic root")
+        self.git(self.seed, "push", "--force", "origin", f"{replacement}:refs/heads/main")
+        notice = self.check_update()
+        self.assertEqual(notice.status, "diverged")
+        self.assertNotIn("-update", notice.text)
+
+    def test_check_warns_about_local_changes_but_detects_update(self):
+        self.publish()
+        self.source.write_text("# local work\n")
+        notice = self.check_update()
+        self.assertEqual(notice.status, "available")
+        self.assertIn("Save local changes", notice.detail)
+        self.assertEqual(self.source.read_text(), "# local work\n")
+
+    def test_check_detects_checkout_changed_since_startup(self):
+        target = self.publish()
+        self.git(self.client, "pull", "--ff-only")
+        notice = self.check_update()
+        self.assertEqual(notice.status, "restart")
+        self.assertEqual(self.git(self.client, "rev-parse", "HEAD"), target)
+
+    def test_check_fetch_failure_is_not_up_to_date(self):
+        self.git(self.client, "remote", "set-url", "origin", str(self.root / "missing"))
+        notice = self.check_update()
+        self.assertEqual(notice.status, "error")
+        self.assertIn("failed", notice.text)
+
+    def test_fast_forward_and_new_version(self):
+        target = self.publish()
+        result, output, error = self.update()
+        self.assertEqual(result, 0, error)
+        self.assertEqual(self.git(self.client, "rev-parse", "HEAD"), target)
+        self.assertIn(f"r2.{target[:8]}", output)
+        self.assertIn("Start agenttop again", output)
+        self.assertEqual(self.source.read_text(), "# updated synthetic executable\n")
+        self.assertEqual(self.git(self.client, "status", "--porcelain"), "")
+
+    def test_real_cli_updates_and_next_launch_reports_new_version(self):
+        shutil.copyfile(Path(__file__).resolve().parents[1] / "agenttop", self.seed / "agenttop")
+        self.commit(self.seed, "Install actual updater in fixture")
+        self.git(self.seed, "push", "origin", "main")
+        self.git(self.client, "pull", "--ff-only")
+        with (self.seed / "agenttop").open("a") as source:
+            source.write("\n# Synthetic update fixture.\n")
+        target = self.commit(self.seed, "Publish updater fixture revision")
+        self.git(self.seed, "push", "origin", "main")
+        result = subprocess.run([sys.executable, str(self.source), "-update"],
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"r3.{target[:8]}", result.stdout)
+        launched = subprocess.run([sys.executable, str(self.source), "--version"],
+                                  check=True, capture_output=True, text=True, timeout=10)
+        self.assertEqual(launched.stdout.strip(), f"agenttop r3.{target[:8]}")
+
+    @unittest.skipUnless(os.name == "posix", "Interactive PTY test requires POSIX")
+    def test_live_tui_shows_available_update_and_can_disable_checks(self):
+        import fcntl
+        import pty
+        import select
+        import struct
+        import termios
+
+        shutil.copyfile(Path(__file__).resolve().parents[1] / "agenttop", self.seed / "agenttop")
+        self.commit(self.seed, "Install TUI fixture")
+        self.git(self.seed, "push", "origin", "main")
+        self.git(self.client, "pull", "--ff-only")
+        installed = self.git(self.client, "rev-parse", "HEAD")
+        (self.seed / "example.txt").write_text("New synthetic release")
+        available = self.commit(self.seed, "New TUI fixture release")
+        self.git(self.seed, "push", "origin", "main")
+        log = self.root / "events.jsonl"
+        log.write_text(json.dumps({"type": "session.start", "id": "synthetic",
+                                   "data": {"sessionId": "example"}}) + "\n")
+
+        for extra, expected in ((["--no-update-check"], b"Updates off"),
+                                ([], b"Update: agenttop -update")):
+            with self.subTest(options=extra):
+                master, slave = pty.openpty()
+                fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 160, 0, 0))
+                process = subprocess.Popen(
+                    [sys.executable, str(self.source), "--log", str(log), *extra],
+                    stdin=slave, stdout=slave, stderr=slave, env={**os.environ, "TERM": "xterm-256color"},
+                )
+                os.close(slave)
+                output = bytearray()
+                def drain(duration):
+                    deadline = time.monotonic() + duration
+                    while time.monotonic() < deadline:
+                        if select.select([master], [], [], 0.05)[0]:
+                            try:
+                                output.extend(os.read(master, 65536))
+                            except OSError:
+                                return
+                try:
+                    for _ in range(50):
+                        drain(0.1)
+                        if expected in output:
+                            break
+                    self.assertIn(expected, output)
+                    self.assertEqual(self.git(self.client, "rev-parse", "HEAD"), installed)
+                    self.assertEqual(self.git(self.client, "rev-parse", "origin/main"),
+                                     installed if extra else available)
+                    os.write(master, b"q")
+                    drain(0.5)
+                    process.wait(timeout=3)
+                    self.assertEqual(process.returncode, 0)
+                finally:
+                    os.close(master)
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait(timeout=3)
+
+    def test_up_to_date(self):
+        result, output, error = self.update()
+        self.assertEqual(result, 0, error)
+        self.assertIn("Already up to date", output)
+        self.assertEqual(self.git(self.client, "rev-parse", "HEAD"), self.before)
+
+    def test_dirty_checkout_is_not_fetched_or_modified(self):
+        self.publish()
+        self.source.write_text("# local work\n")
+        result, _, error = self.update()
+        self.assertEqual(result, 1)
+        self.assertIn("Local changes", error)
+        self.assertEqual(self.source.read_text(), "# local work\n")
+        self.assertEqual(self.git(self.client, "rev-parse", "origin/main"), self.before)
+
+    def test_untracked_files_are_preserved(self):
+        self.publish()
+        local = self.client / "notes.txt"
+        local.write_text("Local notes")
+        result, _, error = self.update()
+        self.assertEqual(result, 1)
+        self.assertIn("untracked", error)
+        self.assertEqual(local.read_text(), "Local notes")
+        self.assertEqual(self.git(self.client, "rev-parse", "HEAD"), self.before)
+
+    def test_rewritten_history_is_rejected(self):
+        tree = self.git(self.seed, "rev-parse", "HEAD^{tree}")
+        replacement = self.git(self.seed, "commit-tree", tree, "-m", "Unrelated synthetic root")
+        self.git(self.seed, "push", "--force", "origin", f"{replacement}:refs/heads/main")
+        result, _, error = self.update()
+        self.assertEqual(result, 1)
+        self.assertIn("not a fast-forward", error)
+        self.assertEqual(self.git(self.client, "rev-parse", "HEAD"), self.before)
+        self.assertEqual(self.source.read_text(), "# initial synthetic executable\n")
+
+    def test_local_commits_are_not_reset(self):
+        self.source.write_text("# local commit\n")
+        local = self.commit(self.client, "Local work")
+        self.publish()
+        result, _, error = self.update()
+        self.assertEqual(result, 1)
+        self.assertIn("not a fast-forward", error)
+        self.assertEqual(self.git(self.client, "rev-parse", "HEAD"), local)
+
+    def test_fetch_failure_is_reported(self):
+        self.git(self.client, "remote", "set-url", "origin", str(self.root / "missing"))
+        result, _, error = self.update()
+        self.assertEqual(result, 1)
+        self.assertIn("Fetching origin/main failed", error)
+        self.assertEqual(self.git(self.client, "rev-parse", "HEAD"), self.before)
+
+    def test_non_main_branch_is_not_switched(self):
+        self.git(self.client, "switch", "-c", "feature")
+        result, _, error = self.update()
+        self.assertEqual(result, 1)
+        self.assertIn("require branch main", error)
+        self.assertEqual(self.git(self.client, "branch", "--show-current"), "feature")
+
+    def test_detached_checkout_is_not_switched(self):
+        self.git(self.client, "checkout", "--detach")
+        result, _, error = self.update()
+        self.assertEqual(result, 1)
+        self.assertIn("Detached HEAD", error)
+        self.assertEqual(self.git(self.client, "rev-parse", "HEAD"), self.before)
+
+    def test_existing_git_operation_is_not_disturbed(self):
+        merge_head = self.client / ".git" / "MERGE_HEAD"
+        merge_head.write_text(self.before + "\n")
+        result, _, error = self.update()
+        self.assertEqual(result, 1)
+        self.assertIn("operation is in progress", error)
+        self.assertTrue(merge_head.exists())
+
+    def test_standalone_copy_is_not_replaced(self):
+        source = self.root / "agenttop"
+        source.write_text("# standalone copy\n")
+        result, _, error = self.update(source)
+        self.assertEqual(result, 1)
+        self.assertIn("no Git metadata", error)
+        self.assertEqual(source.read_text(), "# standalone copy\n")
+
+    @unittest.skipIf(os.name == "nt", "Creating symlinks can require Windows privileges")
+    def test_symlink_updates_installed_checkout_not_current_directory(self):
+        target = self.publish()
+        launcher = self.root / "launcher"
+        launcher.symlink_to(self.source)
+        result, _, error = self.update(launcher)
+        self.assertEqual(result, 0, error)
+        self.assertTrue(launcher.is_symlink())
+        self.assertEqual(self.git(self.client, "rev-parse", "HEAD"), target)
+
+    def test_ignored_file_is_not_overwritten(self):
+        self.git(self.client, "config", "merge.autoStash", "true")
+        (self.client / ".git" / "info").mkdir(exist_ok=True)
+        (self.client / ".git" / "info" / "exclude").write_text("settings.txt\n")
+        (self.client / "settings.txt").write_text("Private local settings")
+        (self.seed / "settings.txt").write_text("New tracked default")
+        self.publish()
+        result, _, error = self.update()
+        self.assertEqual(result, 1)
+        self.assertIn("Applying fast-forward failed", error)
+        self.assertEqual((self.client / "settings.txt").read_text(), "Private local settings")
+        self.assertEqual(self.git(self.client, "rev-parse", "HEAD"), self.before)
+
+    def test_shallow_clone_is_not_updated(self):
+        shallow = self.root / "shallow"
+        self.git(self.root, "clone", "--depth=1", "--template=", self.remote.as_uri(), str(shallow))
+        result, _, error = self.update(shallow / "agenttop")
+        self.assertEqual(result, 1)
+        self.assertIn("Shallow history", error)
+
+    def test_timeout_and_missing_git_are_reported(self):
+        for exception in (subprocess.TimeoutExpired("git", 10), FileNotFoundError("git")):
+            with self.subTest(exception=type(exception).__name__):
+                with patch.dict(APP["update_checkout"].__globals__, git_output=unittest.mock.Mock(side_effect=exception)):
+                    result, _, error = self.update()
+                self.assertEqual(result, 1)
+                self.assertIn("Update stopped", error)
+
+    def test_both_cli_aliases_exit_without_reading_sessions(self):
+        with patch.dict(APP["main"].__globals__, update_checkout=unittest.mock.Mock(return_value=0)):
+            with patch.object(Monitor, "refresh", side_effect=AssertionError("Must not read logs")):
+                for flag in ("-update", "--update"):
+                    self.assertEqual(APP["main"]([flag]), 0)
+
+    def test_update_cannot_be_combined_with_snapshot_options(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as exc:
+                APP["main"](["--update", "--json"])
+        self.assertEqual(exc.exception.code, 2)
+
+
+class UpdateIndicatorTests(unittest.TestCase):
+    def checker(self):
+        checker = APP["UpdateChecker"](root="/synthetic-checkout")
+        self.addCleanup(checker.close)
+        return checker
+
+    def test_checks_at_startup_then_only_after_eight_hours(self):
+        checker = self.checker()
+        notice = APP["UpdateNotice"]("current", "Up to date", "")
+        with patch.object(checker, "work", side_effect=lambda: checker.results.put(notice)) as worker:
+            with patch("time.monotonic", return_value=100):
+                checker.poll()
+                checker.thread.join(timeout=2)
+                self.assertFalse(checker.thread.is_alive())
+                self.assertEqual(checker.poll().status, "current")
+            with patch("time.monotonic", return_value=100 + 8 * 60 * 60 - 1):
+                checker.poll()
+                self.assertEqual(worker.call_count, 1)
+            with patch("time.monotonic", return_value=100 + 8 * 60 * 60):
+                checker.poll()
+                checker.thread.join(timeout=2)
+                self.assertEqual(worker.call_count, 2)
+        self.assertEqual(APP["UPDATE_CHECK_INTERVAL"], 28800)
+
+    def test_slow_check_does_not_block_poll_or_spawn_duplicates(self):
+        checker = self.checker()
+        started, release = threading.Event(), threading.Event()
+        def wait():
+            started.set()
+            release.wait(timeout=5)
+        with patch.object(checker, "work", side_effect=wait) as worker:
+            try:
+                checker.poll()
+                self.assertTrue(started.wait(timeout=2))
+                self.assertTrue(checker.thread.is_alive())
+                checker.next_check = 0
+                checker.poll()
+                self.assertEqual(worker.call_count, 1)
+            finally:
+                release.set()
+                checker.thread.join(timeout=2)
+
+    def test_failure_replaces_previous_available_notice(self):
+        checker = self.checker()
+        checker.next_check = float("inf")
+        checker.notice = APP["UpdateNotice"]("available", "Update: agenttop -update", "")
+        checker.results.put(APP["UpdateNotice"]("error", "Update check failed", "Authentication failed"))
+        self.assertEqual(checker.poll().status, "error")
+
+    def test_header_reserves_right_edge_at_different_widths(self):
+        for width in (0, 1, 8, 40, 80, 160):
+            with self.subTest(width=width):
+                left, right = APP["header_parts"]("agenttop " + "statistics " * 50,
+                                                 "Update: agenttop -update", width)
+                self.assertEqual(len(left + right), max(0, width - 1))
+                if width >= 40:
+                    self.assertEqual(right, "Update: agenttop -update")
+                    self.assertTrue((left + right).endswith("agenttop -update"))
+
+    def test_background_git_cannot_prompt_on_terminal(self):
+        checker = self.checker()
+        process = Mock()
+        process.communicate.return_value = ("result\n", "")
+        process.returncode = 0
+        with patch("subprocess.Popen", return_value=process) as popen:
+            self.assertEqual(checker.git("rev-parse", "HEAD"), "result")
+        kwargs = popen.call_args.kwargs
+        self.assertEqual(kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
+        self.assertEqual(kwargs["env"]["GCM_INTERACTIVE"], "never")
+        self.assertTrue(kwargs["start_new_session"])
+        self.assertIsNone(checker.process)
+
+    def test_close_cancels_owned_process_and_prevents_new_checks(self):
+        checker = self.checker()
+        process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
+                                   start_new_session=True)
+        checker.process = process
+        try:
+            checker.close()
+            process.wait(timeout=3)
+            self.assertIsNotNone(process.returncode)
+            checker.poll()
+            self.assertIsNone(checker.thread)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=3)
+            checker.process = None
+
+    @unittest.skipUnless(os.name == "posix", "POSIX process-group regression")
+    def test_timeout_cleans_helpers_after_git_parent_exits(self):
+        checker = self.checker()
+        code = ("import subprocess, sys; "
+                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])")
+        process = subprocess.Popen([sys.executable, "-c", code],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, start_new_session=True)
+        process.wait(timeout=3)
+        self.assertEqual(process.returncode, 0)
+        communicate = process.communicate
+        errors = []
+        def run():
+            try:
+                checker.git("fetch")
+            except subprocess.TimeoutExpired as exc:
+                errors.append(exc)
+        def short_timeout(timeout=None):
+            return communicate(timeout=0.1 if timeout == 30 else timeout)
+        with patch("subprocess.Popen", return_value=process), patch.object(process, "communicate", side_effect=short_timeout):
+            worker = threading.Thread(target=run, daemon=True)
+            try:
+                worker.start()
+                worker.join(timeout=2)
+                self.assertFalse(worker.is_alive(), "Exited parent left a helper holding the output pipes")
+                self.assertEqual(len(errors), 1)
+            finally:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                worker.join(timeout=2)
+                process.stdout.close()
+                process.stderr.close()
+
+    def test_unsupported_install_and_failures_are_explicit(self):
+        git = Mock()
+        notice = APP["check_update"]("/nonexistent-synthetic-checkout", git)
+        self.assertEqual(notice.status, "unavailable")
+        git.assert_not_called()
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / ".git").mkdir()
+            for exception in (subprocess.TimeoutExpired("git", 5), FileNotFoundError("git")):
+                notice = APP["check_update"](directory, Mock(side_effect=exception))
+                self.assertEqual(notice.status, "error")
+
+    def test_snapshots_and_version_do_not_start_background_checks(self):
+        globals_ = APP["main"].__globals__
+        with patch.dict(globals_, UpdateChecker=Mock(side_effect=AssertionError("Unexpected update check")),
+                        run_once=Mock()):
+            with patch.object(sys.stdout, "isatty", return_value=False):
+                for args in ([], ["--once"], ["--json"]):
+                    self.assertEqual(APP["main"](args), 0)
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as exc:
+                APP["main"](["--version"])
+            self.assertEqual(exc.exception.code, 0)
+
+    def test_no_update_check_is_forwarded_to_tui(self):
+        tui = Mock()
+        with patch.dict(APP["main"].__globals__, run_tui=tui):
+            with patch.object(sys.stdout, "isatty", return_value=True):
+                APP["main"](["--no-update-check"])
+                self.assertFalse(tui.call_args.kwargs["check_updates"])
+                APP["main"]([])
+                self.assertTrue(tui.call_args.kwargs["check_updates"])
 
 
 class MonitorTests(unittest.TestCase):

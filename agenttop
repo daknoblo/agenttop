@@ -26,13 +26,23 @@ import hashlib
 import json
 import math
 import os
+import queue
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from functools import lru_cache
+
+
+def git_output(root, *args, timeout=10):
+    return subprocess.run(
+        ["git", "-C", root, *args], check=True, capture_output=True,
+        text=True, timeout=timeout,
+    ).stdout.strip()
 
 
 @lru_cache(maxsize=1)
@@ -42,10 +52,7 @@ def version():
     root = os.path.dirname(path)
     if os.path.exists(os.path.join(root, ".git")):
         def git(*args):
-            return subprocess.run(
-                ["git", "-C", root, *args], check=True, capture_output=True,
-                text=True, timeout=3,
-            ).stdout.strip()
+            return git_output(root, *args, timeout=3)
 
         try:
             count = git("rev-list", "--count", "HEAD")
@@ -61,6 +68,241 @@ def version():
     except OSError:
         return "unknown (source unavailable)"
     return f"unversioned.{digest}"
+
+
+class UpdateError(Exception):
+    pass
+
+
+def update_checkout():
+    """Update the installed checkout, never the caller's working directory."""
+    source = os.path.realpath(__file__)
+    root = os.path.dirname(source)
+
+    def require_clean():
+        if git_output(root, "status", "--porcelain", "--untracked-files=normal",
+                      "--ignore-submodules=none"):
+            raise UpdateError(
+                "Local changes or untracked files found. Save your work and make the "
+                "checkout clean before updating; nothing will be reset or stashed."
+            )
+        if git_output(root, "symbolic-ref", "--quiet", "--short", "HEAD") != "main":
+            raise UpdateError("Updates require branch main. Switch branches manually after saving your work.")
+        for name in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD",
+                     "rebase-merge", "rebase-apply", "sequencer", "BISECT_START"):
+            path = git_output(root, "rev-parse", "--git-path", name)
+            if os.path.exists(os.path.join(root, path)):
+                raise UpdateError("A Git operation is in progress. Finish or abort it manually before updating.")
+
+    stage = "Checking installation"
+    try:
+        if not os.path.exists(os.path.join(root, ".git")):
+            raise UpdateError(
+                "This installation has no Git metadata. Install a main-branch Git checkout "
+                "as described in docs/installation.md; standalone copies cannot self-update."
+            )
+        if os.path.realpath(git_output(root, "rev-parse", "--show-toplevel")) != root:
+            raise UpdateError("The executable is not at the Git checkout root; update manually.")
+        git_output(root, "ls-files", "--error-unmatch", "--", os.path.basename(source))
+        if git_output(root, "rev-parse", "--is-shallow-repository") == "true":
+            raise UpdateError(
+                "Shallow history cannot establish a safe update. Fetch complete history "
+                "manually or use a full clone before retrying."
+            )
+        if git_output(root, "rev-parse", "--abbrev-ref", "HEAD") == "HEAD":
+            raise UpdateError("Detached HEAD detected. Switch to main manually before updating.")
+        require_clean()
+        before = git_output(root, "rev-parse", "HEAD")
+        stage = "Fetching origin/main"
+        print("Fetching origin/main...", flush=True)
+        git_output(root, "fetch", "--no-tags", "--no-recurse-submodules", "origin",
+                   "+refs/heads/main:refs/remotes/origin/main", timeout=120)
+        target = git_output(root, "rev-parse", "refs/remotes/origin/main")
+        stage = "Checking fast-forward"
+        require_clean()
+        if git_output(root, "rev-parse", "HEAD") != before:
+            raise UpdateError("The checkout changed during the fetch. Retry after other Git operations finish.")
+        if target == before:
+            version.cache_clear()
+            print(f"Already up to date: agenttop {version()}")
+            return 0
+        try:
+            git_output(root, "merge-base", "--is-ancestor", before, target)
+        except subprocess.CalledProcessError as exc:
+            if exc.returncode != 1:
+                raise
+            raise UpdateError(
+                "origin/main is not a fast-forward of this checkout (local commits or "
+                "rewritten history). Update stopped. Preserve your installation and "
+                "follow the fresh-clone instructions; no reset or reinstall was performed."
+            ) from exc
+        git_output(root, "cat-file", "-e", f"{target}:{os.path.basename(source)}")
+        stage = "Applying fast-forward"
+        git_output(root, "-c", "merge.autoStash=false", "merge", "--ff-only",
+                   "--no-autostash", "--no-overwrite-ignore", "--no-edit", target, timeout=120)
+        if git_output(root, "rev-parse", "HEAD") != target:
+            raise UpdateError("Unexpected HEAD after updating. Inspect the checkout before running agenttop.")
+        version.cache_clear()
+        print(f"Updated {before[:8]} -> {target[:8]}: agenttop {version()}")
+        print("Start agenttop again to run the new version; restart other running monitors too.")
+        return 0
+    except UpdateError as exc:
+        print(f"Update stopped: {exc}", file=sys.stderr)
+    except subprocess.TimeoutExpired:
+        print(f"Update stopped: {stage} timed out. Check Git status and network/authentication before retrying.",
+              file=sys.stderr)
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        print(f"Update stopped: {stage} failed (Git exit {exc.returncode})."
+              f"{' ' + detail if detail else ''}", file=sys.stderr)
+    except OSError as exc:
+        print(f"Update stopped: {stage}: {exc}", file=sys.stderr)
+    return 1
+
+
+UPDATE_CHECK_INTERVAL = 8 * 60 * 60
+UpdateNotice = collections.namedtuple("UpdateNotice", "status text detail")
+
+
+def check_update(root, git, loaded_revision=""):
+    """Compare ancestry, not just hashes: local-only commits are not updates."""
+    try:
+        if not os.path.exists(os.path.join(root, ".git")):
+            return UpdateNotice("unavailable", "Updates: unavailable", "Update checks require a Git checkout.")
+        if os.path.realpath(git("rev-parse", "--show-toplevel")) != os.path.realpath(root):
+            return UpdateNotice("unavailable", "Updates: unavailable", "The executable must be at the checkout root.")
+        if git("rev-parse", "--abbrev-ref", "HEAD") != "main":
+            return UpdateNotice("unavailable", "Updates: not on main", "Switch to main manually to check for updates.")
+        if git("rev-parse", "--is-shallow-repository") == "true":
+            return UpdateNotice("unavailable", "Updates: shallow clone", "A full-history clone is required for update checks.")
+        before = git("rev-parse", "HEAD")
+        if loaded_revision and not before.startswith(loaded_revision):
+            return UpdateNotice("restart", "Restart agenttop", "The checkout changed since this monitor started.")
+        git("fetch", "--no-tags", "--no-recurse-submodules", "origin",
+            "+refs/heads/main:refs/remotes/origin/main")
+        target = git("rev-parse", "refs/remotes/origin/main")
+        if git("rev-parse", "HEAD") != before:
+            return UpdateNotice("restart", "Restart agenttop", "The checkout changed during the update check.")
+        if before == target:
+            return UpdateNotice("current", "Up to date", "")
+
+        def ancestor(left, right):
+            try:
+                git("merge-base", "--is-ancestor", left, right)
+                return True
+            except subprocess.CalledProcessError as exc:
+                if exc.returncode != 1:
+                    raise
+                return False
+
+        if ancestor(before, target):
+            revision = f"r{git('rev-list', '--count', target)}.{target[:8]}"
+            detail = f"{revision} available. Quit and run agenttop -update, then restart."
+            if git("status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=none"):
+                detail += " Save local changes and clean the checkout first."
+            return UpdateNotice("available", "Update: agenttop -update", detail)
+        if ancestor(target, before):
+            return UpdateNotice("ahead", "Local commits ahead", "No fast-forward update: this checkout has local-only commits.")
+        return UpdateNotice("diverged", "History differs", "origin/main has diverged or was rewritten; a manual update is required.")
+    except subprocess.TimeoutExpired:
+        return UpdateNotice("error", "Update check failed", "Update check timed out; retrying in eight hours.")
+    except subprocess.CalledProcessError as exc:
+        return UpdateNotice("error", "Update check failed",
+                            f"Git exited with code {exc.returncode}. Check origin, network and Git authentication; retrying in eight hours.")
+    except OSError as exc:
+        return UpdateNotice("error", "Update check failed", f"Git could not run ({type(exc).__name__}); retrying in eight hours.")
+
+
+class CheckCancelled(Exception):
+    pass
+
+
+class UpdateChecker:
+    def __init__(self, root=None):
+        self.root = root or os.path.dirname(os.path.realpath(__file__))
+        match = re.match(r"r\d+\.([0-9a-f]+)", version())
+        self.loaded_revision = match.group(1) if match else ""
+        self.notice = UpdateNotice("checking", "Checking updates...", "")
+        self.next_check = 0.0
+        self.results = queue.SimpleQueue()
+        self.thread = None
+        self.stopped = threading.Event()
+        self.process_lock = threading.Lock()
+        self.process = None
+
+    @staticmethod
+    def terminate(process):
+        try:
+            if os.name == "posix":
+                # Git can exit before helpers that still own its output pipes.
+                os.killpg(process.pid, signal.SIGKILL)
+            elif process.poll() is None:
+                process.kill()
+        except ProcessLookupError:
+            pass
+
+    def git(self, *args):
+        env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never",
+                   SSH_ASKPASS_REQUIRE="never")
+        with self.process_lock:
+            if self.stopped.is_set():
+                raise CheckCancelled()
+            process = subprocess.Popen(
+                ["git", "-C", self.root, "-c", "credential.interactive=false",
+                 "-c", "core.askPass=", *args],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, env=env, start_new_session=True,
+            )
+            self.process = process
+        try:
+            try:
+                output, error = process.communicate(timeout=30 if args[0] == "fetch" else 5)
+            except subprocess.TimeoutExpired:
+                self.terminate(process)
+                try:
+                    process.communicate(timeout=1)
+                except subprocess.TimeoutExpired:
+                    process.stdout.close()
+                    process.stderr.close()
+                raise
+            if self.stopped.is_set():
+                raise CheckCancelled()
+            if process.returncode:
+                raise subprocess.CalledProcessError(process.returncode, process.args, output, error)
+            return output.strip()
+        finally:
+            with self.process_lock:
+                self.process = None
+
+    def work(self):
+        try:
+            notice = check_update(self.root, self.git, self.loaded_revision)
+        except CheckCancelled:
+            return
+        self.results.put(notice)
+
+    def poll(self):
+        while True:
+            try:
+                self.notice = self.results.get_nowait()
+            except queue.Empty:
+                break
+        now = time.monotonic()
+        if (not self.stopped.is_set() and now >= self.next_check
+                and (self.thread is None or not self.thread.is_alive())):
+            self.next_check = now + UPDATE_CHECK_INTERVAL
+            self.thread = threading.Thread(target=self.work, name="agenttop-update-check", daemon=True)
+            self.thread.start()
+        return self.notice
+
+    def close(self):
+        self.stopped.set()
+        with self.process_lock:
+            if self.process is not None:
+                self.terminate(self.process)
+        if self.thread is not None:
+            self.thread.join(timeout=1)
+
 
 # ---------------------------------------------------------------------------
 # discovery
@@ -1104,9 +1346,18 @@ def build_display(mon: Monitor, rows, now, width, tree, collapsed, sessions=None
 # ---------------------------------------------------------------------------
 
 
+def header_parts(text, notice, width):
+    available = max(0, width - 1)
+    right = clip(notice, available)
+    left_width = max(0, available - len(right) - (1 if right else 0))
+    return clip(text, left_width).ljust(available - len(right)), right
+
+
 def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done=False,
-            sort_key="runtime", query=""):
+            sort_key="runtime", query="", check_updates=True):
     import curses
+
+    checker = UpdateChecker() if check_updates else None
 
     def main(stdscr):
         try:
@@ -1146,6 +1397,8 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
         show_help = False
 
         while True:
+            notice = (checker.poll() if checker else
+                      UpdateNotice("disabled", "Updates off", ""))
             if time.time() - last_poll >= interval:
                 mon.refresh()
                 last_poll = time.time()
@@ -1165,8 +1418,13 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                        f"{'  tree' if tree_mode else '  flat'}{'  +done' if show_done else ''}"
                        f"{'  filter:' + session_focus[:8] if session_focus else ''} ")
             try:
-                stdscr.addnstr(0, 0, (title + summary).ljust(width), width,
+                left, right = header_parts(title + summary, notice.text, width)
+                stdscr.addnstr(0, 0, left, len(left),
                                curses.color_pair(6) if use_color else curses.A_REVERSE)
+                color = {"available": 2, "error": 5, "current": 1,
+                         "diverged": 2, "restart": 2}.get(notice.status, 6)
+                stdscr.addnstr(0, len(left), right, len(right),
+                               (curses.color_pair(color) if use_color else curses.A_REVERSE) | curses.A_BOLD)
             except curses.error:
                 pass
 
@@ -1181,6 +1439,9 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                     "Idle background agents can be resumed with write_agent.",
                     "--source cli|vscode|all selects the log source at startup.",
                     "Only recorded events are shown; status is not a process health check.",
+                    "Updates: checked at startup and every eight hours; --no-update-check disables.",
+                    "To install an available update: quit, run agenttop -update, then restart.",
+                    notice.detail,
                 ]
                 for i, text in enumerate(help_lines[:max(0, height - 3)]):
                     try:
@@ -1196,6 +1457,8 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                 except curses.error:
                     pass
                 foot = footer_lines(mon, width, sessions)
+                if notice.detail:
+                    foot.append(clip(notice.detail, width - 1))
                 top = 2
                 avail = max(1, height - top - len(foot) - 1)
                 cursor = max(0, min(cursor, max(0, len(body) - 1)))
@@ -1320,7 +1583,11 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                 if kind == "session":
                     collapsed.symmetric_difference_update({obj})
 
-    curses.wrapper(main)
+    try:
+        curses.wrapper(main)
+    finally:
+        if checker:
+            checker.close()
 
 
 def render_detail(stdscr, agent, height, width):
@@ -1494,6 +1761,10 @@ def positive_float(value):
 def main(argv=None):
     ap = argparse.ArgumentParser(description="htop-style monitor for Copilot CLI and VS Code sessions")
     ap.add_argument("--version", action="version", version=f"agenttop {version()}")
+    ap.add_argument("-update", "--update", action="store_true",
+                    help="update this Git installation from origin/main (fast-forward only), then exit")
+    ap.add_argument("--no-update-check", action="store_true",
+                    help="disable the TUI background update check (normally at startup and every 8 hours)")
     ap.add_argument("--log", action="append", metavar="PATH",
                     help="AHP log, CLI events.jsonl, or directory (repeatable); default: auto-discover both")
     ap.add_argument("--source", choices=["all", "cli", "vscode"], default="all", help="log sources to read (default: all)")
@@ -1510,6 +1781,11 @@ def main(argv=None):
     ap.add_argument("--json", action="store_true", help="print one snapshot as JSON and exit")
     args = ap.parse_args(argv)
 
+    if args.update:
+        if len(sys.argv[1:] if argv is None else argv) != 1:
+            ap.error("--update must be used on its own")
+        return update_checkout()
+
     mon = Monitor(targets=args.log, max_age_h=args.max_age, source=args.source, cli_dir=args.cli_dir)
     if args.once or args.json or not sys.stdout.isatty():
         run_once(mon, args.all_done or args.json, args.sort, args.json,
@@ -1517,7 +1793,8 @@ def main(argv=None):
         return 0
     try:
         run_tui(mon, args.interval, tree=not args.flat, sess_filter=args.session,
-                all_done=args.all_done, sort_key=args.sort, query=args.search)
+                all_done=args.all_done, sort_key=args.sort, query=args.search,
+                check_updates=not args.no_update_check)
     except KeyboardInterrupt:
         pass
     return 0

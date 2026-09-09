@@ -90,6 +90,40 @@ Check which executable your shell resolves and run it with `--version`.
 After updating, restart the monitor. Revision counts can change after branch
 switches or history rewrites; the commit hash is the precise identifier.
 
+## Self-update stops or the flag is not recognized
+
+The top-right update indicator runs a noninteractive check at startup and every
+eight hours. `Update check failed` is not the same as `Up to date`: check network
+access and Git authentication outside the TUI. The next scheduled check retries
+after eight hours. Pressing `r` only reloads logs.
+
+`Local commits ahead` or `History differs` means Git ancestry does not permit the
+normal fast-forward updater. `Restart agenttop` means the installation changed
+while this process was running. A clean full-history main-branch checkout is
+required for normal checks. Use `--no-update-check` to keep monitoring offline.
+Read-only checkouts can also prevent the fetch from updating Git metadata.
+
+`agenttop -update` and `agenttop --update` are aliases and must be used alone.
+An older version without this feature must first be updated manually; see
+[updating](installation.md#updating).
+
+- **Local changes/untracked files:** inspect `git status` in the installation
+  checkout and preserve your work. The updater never stashes or discards it.
+- **Not a fast-forward:** there are local commits, divergence, or rewritten
+  remote history. Preserve the checkout and install a fresh main-branch clone.
+- **Other branch/detached HEAD:** switch to `main` manually after saving your work.
+- **Shallow history:** fetch complete history manually or use a full clone.
+- **Git operation in progress:** finish or abort that operation manually.
+- **No Git metadata:** standalone copies and source archives cannot self-update.
+- **Fetch error:** verify network access, `origin`, and Git authentication.
+  Private repositories require authorized access.
+- **Timeout:** inspect the checkout before retrying; a fetch or merge may have
+  been interrupted. No automatic rollback or reinstall is attempted.
+
+Ignored files normally do not make a checkout dirty, but an update that would
+overwrite one is rejected. A successful update does not reload another running
+monitor: quit that process and start it again.
+
 ## Reporting an issue safely
 
 Include OS, Python version, terminal, `agenttop --version`, source mode,

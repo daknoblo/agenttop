@@ -91,6 +91,8 @@ cp agenttop ~/.local/bin/ && chmod +x ~/.local/bin/agenttop
 
 ```sh
 agenttop                      # combined CLI + VS Code session tree
+agenttop -update              # fast-forward this installation from origin/main
+agenttop --no-update-check    # disable background update checks in the TUI
 agenttop --source cli         # only Copilot events.jsonl histories
 agenttop --source vscode      # only VS Code AHP logs (previous behavior)
 agenttop --once               # one plain-text snapshot
@@ -131,13 +133,63 @@ for example `r42.0123abcd`:
 
 Use `agenttop --version` to print this information without reading session logs.
 The version is captured at startup: restart an already running monitor after an
-update. This identifies the local revision; it does not query GitHub for updates.
+update. The version label identifies the local revision; `--version` itself
+does not query GitHub for updates.
 Counts are not a globally monotonic release number across rebases, history rewrites
 or branch switches, so compare the commit hash as well.
 
 `make install` uses a symlink and retains access to Git metadata. A standalone copy
 without that metadata shows `unversioned.<source-fingerprint>` instead of inventing
 a commit number. An unavailable Git executable is reported as `unknown`.
+
+### Self-update
+
+Run `agenttop -update` (or `agenttop --update`) on its own, then start the monitor
+again. It fetches `origin/main` and applies a fast-forward to the Git checkout
+containing the executable, including when launched through a symlink.
+
+Updates require a clean, full-history checkout on `main`. Local changes,
+non-ignored untracked files, local commits ahead of/diverging from the remote,
+rewritten history, detached HEAD, an in-progress Git operation, and standalone
+copies stop the update with an error. Nothing is reset, stashed or reinstalled.
+Ignored files that would be overwritten also stop the update.
+
+The updater uses the configured `origin` and your existing Git authentication;
+it does not upload session logs. Git/network errors return a nonzero exit code.
+Monitoring never updates itself automatically. See
+[updating and older installations](docs/installation.md#updating).
+
+### Update indicator
+
+The interactive TUI checks `origin/main` at startup and then **every eight hours**
+per running monitor. The check runs in a background thread; the terminal remains
+responsive. It fetches Git objects and remote-tracking metadata but never changes
+the checkout's branch, program files or session logs.
+
+The top-right corner reserves space for the result, independently of the
+statistics on the left:
+
+| Indicator | Meaning |
+| --- | --- |
+| `Checking updates...` | Initial check is running |
+| `Up to date` | The last successful check found the same commit |
+| `Update: agenttop -update` | A newer fast-forward revision is available |
+| `Local commits ahead` / `History differs` | Not an automatically applicable update |
+| `Restart agenttop` | The checkout changed since this process started |
+| `Update check failed` | Git/network/authentication failed; not proof of being current |
+| `Updates: unavailable` | The installation cannot be checked, for example a standalone copy |
+| `Updates off` | Background checking was disabled |
+
+Details, including an available revision and any local-change warning, appear
+in the footer and help view. To apply an update, quit and run `agenttop -update`,
+then restart. Checks do not bypass the updater's fast-forward and clean-checkout
+requirements.
+
+Use `--no-update-check` for offline/read-only monitoring. `--once`, `--json`,
+redirected snapshots and `--version` never start background checks. Background
+authentication is noninteractive; configure Git access separately if needed.
+Failed checks are retried at the next eight-hour interval, not continuously.
+The `r` key refreshes logs only and does not trigger extra update checks.
 
 ### Keys
 
@@ -232,7 +284,10 @@ rotation preserves reconstructed state. Replayed CLI event IDs and identical AHP
 records are deduplicated, so replaying a history does not add the same usage twice.
 Unreadable files and malformed relevant JSON records are surfaced as warnings.
 
-Nothing is written back and no API is called — the tool only reads local log files.
+Session monitoring never writes to session histories or calls Copilot APIs.
+The TUI's optional background version check fetches from the configured Git
+remote without changing program files. The explicit `--update` mode applies
+a fast-forward to the application checkout, without reading session logs.
 
 ### JSON output
 

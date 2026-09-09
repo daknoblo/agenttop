@@ -123,21 +123,55 @@ Only read logs you are authorized to access.
 
 ## Updating
 
-Update the installed checkout, then restart any running monitor. A running
-process deliberately retains the version it started with.
+In the interactive TUI, the top-right indicator checks for a newer `origin/main`
+revision at startup and every eight hours per running monitor. This check fetches
+remote-tracking metadata in the background, without modifying application files.
+It does not show interactive credential prompts. Configure Git access separately,
+or use `--no-update-check` to disable it. Snapshot and version-only modes never
+run background checks.
+
+Run the updater on its own, then restart any running monitor. A running process
+deliberately retains the version it started with.
 
 macOS / Linux / WSL:
 
 ```sh
-git -C "$HOME/.local/share/agenttop" pull --ff-only
-"$HOME/.local/bin/agenttop" --version
+"$HOME/.local/bin/agenttop" -update
 ```
 
 Windows PowerShell:
 
 ```powershell
-& { git -C "$env:LOCALAPPDATA\agenttop\src" pull --ff-only; if ($LASTEXITCODE -ne 0) { throw 'Update failed; inspect the checkout before retrying.' }; & "$env:LOCALAPPDATA\agenttop\agenttop.cmd" --version }
+& "$env:LOCALAPPDATA\agenttop\agenttop.cmd" -update
 ```
+
+`--update` is an equivalent alias. If `agenttop` is on Path, simply run
+`agenttop -update`. No terminal UI or `curses` is needed for updating.
+The command prints either the updated version or that it is already up to date,
+then exits. Do not combine it with snapshot or monitoring options.
+
+The updater resolves the executable's real path, checks for a clean Git checkout
+on `main`, fetches `origin/main` using your configured Git credentials, and
+fast-forwards to the fetched commit. It never switches branches, stashes changes,
+resets files, overwrites ignored local files or reinstalls automatically. Fetching
+updates Git's remote-tracking metadata even if the subsequent fast-forward check
+rejects the new history. An update needs write permission to the checkout.
+
+It refuses shallow clones, detached checkouts, in-progress Git operations,
+local changes (including non-ignored untracked files), and histories that cannot
+fast-forward. A network/authentication failure stops the update with a nonzero
+exit code. Inspect Git status after a timeout before retrying.
+
+**Older installations:** versions without this flag need one manual update first:
+
+```sh
+git -C "$HOME/.local/share/agenttop" pull --ff-only origin main
+```
+
+For a Windows installation, run the same Git command with
+`"$env:LOCALAPPDATA\agenttop\src"` as the checkout path.
+If the history was rewritten or the old installation used a removed branch,
+preserve it and use a fresh `main` clone instead.
 
 Do not use a hard reset to get around local changes or diverging branches.
 Inspect `git status` and preserve your changes first. If the public branch
@@ -145,8 +179,8 @@ history was replaced rather than extended, keep the old installation and
 install into a separate directory for comparison.
 
 `rN.<hash>` identifies the local revision. A `-dirty` suffix means the checkout
-has local changes; `-shallow` means its commit count is incomplete. The command
-does not check whether a newer release exists on GitHub.
+has local changes; `-shallow` means its commit count is incomplete.
+`--version` does not contact GitHub; `--update` explicitly fetches the remote.
 
 ## Uninstalling
 

@@ -18,20 +18,34 @@ The first command is interactive; the other two take one snapshot and exit.
 When standard output is redirected, the program defaults to a text snapshot.
 Use `--json` explicitly for structured output.
 
-The application reads files only. It does not contact Copilot, execute agent
+Session monitoring reads files only. It does not contact Copilot, execute agent
 tasks, subscribe to VS Code channels or modify session history.
+The TUI additionally checks the configured Git remote at startup and every
+eight hours without changing program files; disable this with
+`agenttop --no-update-check`. Snapshot modes do not perform that check.
+The separate `agenttop -update` / `agenttop --update` mode fetches the configured
+Git remote and fast-forwards the application checkout, then exits without
+reading session logs. See [updating](installation.md#updating).
 
 ## Reading the display
 
 - **Header:** local program version, visible agent counts, session count,
-  number of input logs, sort order and display mode.
+  number of input logs, sort order and display mode. The top-right corner shows
+  update availability independently of the left-hand statistics.
 - **Session rows:** data source, project/directory label, shortened session ID,
   recorded status, model, activity/title and available usage.
 - **Agent rows:** recorded lifecycle state, runtime, quiet time, shortened ID,
   agent type, execution mode and tool activity.
 - **Wide terminals:** token and AIU columns appear at 132 columns or more.
 - **Footer:** usage for up to three matching sessions with usage data, plus
-  read/parse warnings when present.
+  read/parse warnings and update-check details when present.
+
+When the header says `Update: agenttop -update`, quit with `q`, run
+`agenttop -update`, then start the monitor again. `Up to date` refers to the
+last successful check, not a continuous live comparison. A failed check is
+shown explicitly rather than treated as "no update"; retries occur after eight
+hours. Local-only commits and rewritten history are distinguished from an
+available fast-forward update.
 
 `[cli]` means the session is reconstructed from a CLI-format `events.jsonl`;
 it does not prove the session was started from a terminal. VS Code can persist
