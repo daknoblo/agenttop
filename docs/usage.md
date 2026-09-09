@@ -1,0 +1,144 @@
+# User guide
+
+[Back to README](../README.md) | [Installation](installation.md) | [Troubleshooting](troubleshooting.md)
+
+## Quick start
+
+Launch `agenttop` in an interactive terminal on macOS, Linux or WSL.
+The default view combines locally available Copilot CLI histories and VS Code
+AHP logs modified within the last 24 hours.
+
+```sh
+agenttop
+agenttop --once
+agenttop --json
+```
+
+The first command is interactive; the other two take one snapshot and exit.
+When standard output is redirected, the program defaults to a text snapshot.
+Use `--json` explicitly for structured output.
+
+The application reads files only. It does not contact Copilot, execute agent
+tasks, subscribe to VS Code channels or modify session history.
+
+## Reading the display
+
+- **Header:** local program version, visible agent counts, session count,
+  number of input logs, sort order and display mode.
+- **Session rows:** data source, project/directory label, shortened session ID,
+  recorded status, model, activity/title and available usage.
+- **Agent rows:** recorded lifecycle state, runtime, quiet time, shortened ID,
+  agent type, execution mode and tool activity.
+- **Wide terminals:** token and AIU columns appear at 132 columns or more.
+- **Footer:** usage for up to three matching sessions with usage data, plus
+  read/parse warnings when present.
+
+`[cli]` means the session is reconstructed from a CLI-format `events.jsonl`;
+it does not prove the session was started from a terminal. VS Code can persist
+the same format. If both formats are available, the CLI history supplies state
+and AHP can supplement repository/branch information.
+
+## Find the work you need
+
+```sh
+agenttop --source cli
+agenttop --source vscode
+agenttop --session aaaaaaaa
+agenttop --search parser
+agenttop --sort idle
+agenttop --all-done
+```
+
+`aaaaaaaa` is an illustrative ID prefix, not a real session.
+Search is case-insensitive and matches session labels/titles, model names,
+agent descriptions/names, agent type and identifiers.
+
+In the TUI:
+
+| Key | Action |
+| --- | --- |
+| Up/Down or `k`/`j` | Move selection |
+| Enter | Expand/collapse a session or open agent details |
+| `q` | Close details/help, or quit the main view |
+| `/` | Edit the live search text; Enter finishes editing |
+| Escape | Clear search; leave detail/help when open |
+| `f` | Cycle session focus, then return to all sessions |
+| `d` | Include/exclude terminal sessions and agents |
+| `s` | Cycle runtime, start, idle, status and name sorting |
+| `t` | Toggle session tree / flat agent list |
+| `r` | Force an immediate refresh and source discovery |
+| `?` | Open keyboard help |
+| Page Up/Down, Home/End | Navigate longer lists |
+
+Use the tree view to see sessions that have not delegated any tasks.
+The flat view contains agents only.
+
+## Status and time
+
+| State | Interpretation |
+| --- | --- |
+| `starting` | A delegation was observed but launch is not yet confirmed |
+| `running` | The latest relevant events indicate active work |
+| `idle` | Waiting between turns; a resumable agent can be used again |
+| `done` | Completion recorded for a terminal agent/session |
+| `failed` | A failure was recorded |
+| `cancelled` | Cancellation observed, or an active CLI agent closed at session shutdown |
+| `unknown` / orphan | Insufficient events to reconstruct state reliably |
+
+Runtime is wall-clock time since delegation, not CPU time. It continues for idle
+resumable agents until they are closed. Quiet time is the time since the last
+recorded event, not proof that the underlying process is hung.
+
+One-shot background agents finish when completion is recorded. Resumable agents
+can become idle and return to running on an accepted follow-up message.
+Process crashes without final log events can leave stale-looking states.
+
+## Custom log locations
+
+```sh
+agenttop --cli-dir /path/to/session-state
+agenttop --log /path/to/session/events.jsonl
+agenttop --log /path/to/ahp-log.jsonl --log /path/to/session-state
+agenttop --max-age 72 --interval 2
+```
+
+`--cli-dir` is a root containing per-session directories. `--log` accepts files
+or recursively searched directories, is repeatable, and replaces automatic
+discovery. Explicit log inputs are not restricted by `--max-age`.
+
+Existing files are read incrementally. New-file discovery normally happens
+every five seconds even if `--interval` is shorter.
+
+## JSON snapshots
+
+```sh
+agenttop --json --source cli --session aaaaaaaa > snapshot.json
+```
+
+JSON includes finished entries automatically. Session/text filters apply to
+the session object, agents array and agent counts. `logs` describes the input
+files independently of the display filter.
+
+Top-level fields:
+
+| Field | Contents |
+| --- | --- |
+| `version` | Local revision/fingerprint and any dirty/shallow marker |
+| `generated_at` | UTC snapshot timestamp |
+| `logs` | Local source file paths |
+| `counts` | Visible running, starting, idle and terminal agent counts |
+| `agents` | Agent state, identifiers, timing, source, tools and usage |
+| `sessions` | Session-ID-keyed metadata, status and usage |
+| `errors` | Read/parse warnings; check this before treating a snapshot as complete |
+
+`counts.done` includes failed and cancelled agents. Inspect each agent's `status`
+when the distinction matters.
+
+Missing self/subagent cost attribution is represented as `null`, not an estimated
+split. Other missing numerical metrics may remain zero; zero is not proof of free
+usage. AIU are usage units, not a monetary bill. See
+[accounting details](../README.md#how-it-works).
+
+**Treat snapshots and screenshots as private:** paths, titles, activity,
+identifiers and usage figures can expose work context. Do not commit real
+snapshots, publish them in issues or upload them without reviewing/redacting them.
