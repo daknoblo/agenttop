@@ -583,9 +583,27 @@ class MonitorTests(unittest.TestCase):
         _, display = APP["build_display"](self.mon, rows, now, 240, True, set(), sessions)
         self.assertEqual(len(display), 1)
         self.assertEqual(display[0][0], "session")
-        self.assertIn("[cli]", display[0][3])
+        self.assertTrue(display[0][3].startswith("\u25bc >_ "))
         self.assertIn("project", display[0][3])
         self.assertEqual(self.mon.sessions["session-a"]["title"], "Build something useful")
+
+    def test_source_symbols_in_session_headers_and_text_not_json(self):
+        for source, glyph in (("cli", ">_"), ("vscode", "\u25c7")):
+            with self.subTest(source=source):
+                state = self.mon.state_for("session-a", self.now)
+                state["source"] = source
+                for collapsed, mark in ((set(), "\u25bc"), ({"session-a"}, "\u25b6")):
+                    header = APP["session_header"](self.mon, "session-a", [], self.now, collapsed, 120)
+                    self.assertTrue(header.startswith(f"{mark} {glyph} "))
+                    self.assertNotIn(f"[{source}]", header)
+                text, payload = io.StringIO(), io.StringIO()
+                with patch.object(self.mon, "refresh"):
+                    with contextlib.redirect_stdout(text):
+                        APP["run_once"](self.mon, True, "runtime", False)
+                    with contextlib.redirect_stdout(payload):
+                        APP["run_once"](self.mon, True, "runtime", True)
+                self.assertIn(f"\u25bc {glyph} ", text.getvalue())
+                self.assertEqual(json.loads(payload.getvalue())["sessions"]["session-a"]["source"], source)
 
     def test_background_lifecycle_and_followup(self):
         agent = self.launch()

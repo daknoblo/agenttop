@@ -47,10 +47,13 @@ shown explicitly rather than treated as "no update"; retries occur after eight
 hours. Local-only commits and rewritten history are distinguished from an
 available fast-forward update.
 
-`[cli]` means the session is reconstructed from a CLI-format `events.jsonl`;
+The `>_` symbol means the session is reconstructed from a CLI-format `events.jsonl`;
 it does not prove the session was started from a terminal. VS Code can persist
 the same format. If both formats are available, the CLI history supplies state
 and AHP can supplement repository/branch information.
+The white diamond (U+25C7) denotes an AHP-only VS Code source. Press `?` for the
+symbol legend. Agent details and JSON keep the text names `cli` and `vscode`;
+no special icon font is required.
 
 ## Find the work you need
 

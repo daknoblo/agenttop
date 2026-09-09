@@ -15,7 +15,7 @@ and usage figures (not a captured session):
 ```text
  agenttop r42.0123abcd  12:00:00  running 1  starting 0  idle 1  done 1  | AIU total 12  | sessions 1  logs 1  sort:runtime  tree +done
 S      RUNTIME      QUIET AGENT    TYPE            MOD  TOOLS         TOKENS in/out     AIU TASK
-▼ [cli] example-app@main [aaaaaaaa] running example-model · Update example documentation · 3 agents (2 live, 1 running)
+▼ >_ example-app@main [aaaaaaaa] running example-model · Update example documentation · 3 agents (2 live, 1 running)
 ●      2m 00s         3s 11111111 general-purpose bg   4 · view      12k/1k         1.00 ├─ Update example documentation
 ◌      1m 30s        30s 22222222 explore         bg   2 · glob       6k/1k         0.50 ├─ Find example files
 ✓         45s          - 33333333 code-review     sync 3 · view       8k/1k         0.50 └─ Review example tests
@@ -113,12 +113,14 @@ are not restricted by `--max-age`. `--cli-dir` changes the CLI discovery root.
 `--interval` controls polling (default: one second). Directory discovery runs every
 five seconds; `r` forces an immediate rescan.
 
-The `[cli]` / `[vscode]` label identifies the **data source**, not necessarily the
+The `>_` (CLI) / `◇` (VS Code) symbol identifies the **data source**, not necessarily the
 application that launched the chat. VS Code can also write Copilot CLI session
 histories. When both sources cover the same session, the CLI history supplies
 the lifecycle and usage, while AHP supplies repository/branch metadata. This avoids
 double-counting agents and consumption. A copied `events.jsonl` retains the session
 ID recorded in its `session.start` event; the containing folder is only a fallback.
+These compact symbols need no icon font. The help view (`?`) explains them;
+agent details and JSON retain the source names `cli` and `vscode`.
 
 ### Version identification
 

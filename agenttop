@@ -1158,6 +1158,7 @@ STATUS_GLYPH = {"running": "\u25cf", "starting": "\u25cb", "idle": "\u25cc",
                 "done": "\u2713", "failed": "\u2717", "cancelled": "\u2298", "orphan": "?", "unknown": "?"}
 STATUS_ORDER = {status: i for i, status in enumerate(("running", "starting", "idle", "failed", "cancelled", "done", "orphan"))}
 STATUS_LEGEND = " \u25cf running  \u25cb starting  \u25cc idle  \u2713 done  \u2717 failed  \u2298 cancelled  ? unknown "
+SOURCE_GLYPH = {"cli": ">_", "vscode": "\u25c7"}
 
 
 def fmt_dur(seconds: float) -> str:
@@ -1260,7 +1261,8 @@ def session_header(mon: Monitor, sid, kids, now, collapsed, width):
     aiu = ""
     if st.get("turn_aiu") or st.get("session_aiu"):
         aiu = f"  \u00b7 AIU {fmt_aiu(st.get('turn_aiu', 0))} turn / {fmt_aiu(st.get('session_aiu', 0))} session"
-    head = (f"{mark} [{st.get('source', 'vscode')}] {mon.session_label(sid)} [{sid[:8]}]"
+    source = SOURCE_GLYPH.get(st.get("source", "vscode"), "?")
+    head = (f"{mark} {source} {mon.session_label(sid)} [{sid[:8]}]"
             f" {st.get('status', 'unknown')} {st.get('model') or '-'}"
             f"  \u00b7 {clip(st.get('activity') or st.get('title') or 'idle', 50)}"
             f"  \u00b7 {len(kids)} agents ({len(live)} live, {run} running)"
@@ -1435,7 +1437,7 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                     "d: include finished    t: tree/flat    s: cycle sort",
                     "f: cycle session focus    /: search    Esc: clear search",
                     "r: rescan logs now    ?: help    q: back / quit",
-                    "Sources: cli = events.jsonl, vscode = AHP-only session",
+                    f"Sources: {SOURCE_GLYPH['cli']} CLI history, {SOURCE_GLYPH['vscode']} VS Code AHP",
                     "Idle background agents can be resumed with write_agent.",
                     "--source cli|vscode|all selects the log source at startup.",
                     "Only recorded events are shown; status is not a process health check.",
