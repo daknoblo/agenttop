@@ -632,7 +632,7 @@ class ActivityFilterTests(unittest.TestCase):
                 APP["run_once"](self.mon, False, "name", True, activity="recent")
         payload = json.loads(output.getvalue())
         self.assertEqual({a["call_id"] for a in payload["agents"]}, self.names("recent"))
-        self.assertEqual(payload["counts"], {"running": 1, "starting": 1, "idle": 2, "done": 0})
+        self.assertEqual(payload["counts"], {"running": 1, "starting": 1, "idle": 2, "done": 0, "waiting": 0})
         self.assertEqual(set(payload["sessions"]), {"session-a"})
 
     def test_text_and_tree_use_same_selection(self):
@@ -704,7 +704,7 @@ class StartTimeTests(unittest.TestCase):
         start = header.index("STARTED (local)")
         self.assertEqual(row[start:start + 16], "2026-09-10 09:24")
         self.assertIn("RUNTIME", header)
-        self.assertIn("TOKENS in/out", header)
+        self.assertIn("TOKENS", header)
         self.assertIn("An example", row)
 
     def test_width_limits_and_tree_indentation(self):

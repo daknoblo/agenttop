@@ -13,14 +13,14 @@ Illustrative display with entirely synthetic project names, identifiers, tasks
 and usage figures (not a captured session):
 
 ```text
- agenttop r42.0123abcd  12:00:00  running 1  starting 0  idle 1  done 1  | AIU total 12  | sessions 1  logs 1  sort:runtime  tree activity:all +finished
-S  STARTED (local)       RUNTIME      QUIET AGENT    TYPE            MOD  TOOLS         TOKENS in/out     AIU TASK
+ agenttop r42.0123abcd | AIC total 12  12:00:00  running 1  starting 0  idle 1  done 1  waiting 0 | sessions 1  logs 1  sort:runtime  tree activity:all +finished
+S  STARTED (local)       RUNTIME      QUIET AGENT    TYPE            MOD  MODEL            TOOLS         TOKENS           AIC TASK
 ▼ >_ example-app@main [aaaaaaaa] running example-model · Update example documentation · 3 agents (2 live, 1 running)
-●  2026-01-01 11:58      2m 00s         3s 11111111 general-purpose bg   4 · view      12k/1k         1.00 ├─ Update example documentation
-◌  2026-01-01 11:58      1m 30s        30s 22222222 explore         bg   2 · glob       6k/1k         0.50 ├─ Find example files
-✓  2026-01-01 11:59         45s          - 33333333 code-review     sync 3 · view       8k/1k         0.50 └─ Review example tests
+●  2026-01-01 11:58      2m 00s         3s 11111111 general-purpose bg   example-model    4 · view      12k/1k         1.00 ├─ Update example documentation
+◌  2026-01-01 11:58      1m 30s        30s 22222222 explore         bg   example-model    2 · glob       6k/1k         0.50 ├─ Find example files
+✓  2026-01-01 11:59         45s          - 33333333 code-review     sync example-model    3 · view       sum 9k        0.50 └─ Review example tests
 
-aaaaaaaa example-model ctx 16k/128k (8k cached) turn 32k in / 4k out AIU turn 4.00 (self 2.00 + agents 2.00) session 12
+aaaaaaaa example-model ctx 16k/128k (8k cached) turn 32k in / 4k out AIC turn 4.00 (self 2.00 + agents 2.00) AIC session 12
  q quit  d finished:show  a activity:all  t tree  s sort  f focus  / search  ? help
 ```
 
@@ -232,7 +232,8 @@ The `r` key refreshes logs only and does not trigger extra update checks.
 | --- | --- |
 | `↑` / `↓` (or `k` / `j`) | move the cursor |
 | `Enter` on a session | collapse / expand |
-| `Enter` on an agent | detail view: prompt, tool histogram, tokens, AIU |
+| `Enter` on an agent | scrollable details: model/configuration, approvals, tool results, tokens, AIC |
+| `↑` / `↓`, `Page Up` / `Page Down`, `Home` / `End` in details | scroll through all available fields |
 | `f` | cycle the session focus filter |
 | `t` | toggle tree / flat |
 | `d` | show or hide done, failed and cancelled sessions/agents; footer shows current state |
@@ -249,16 +250,17 @@ The `r` key refreshes logs only and does not trigger extra update checks.
 
 | Column | Meaning |
 | --- | --- |
-| `S` | status: `●` running, `○` starting, `◌` idle, `✓` done, `✗` failed, `⊘` cancelled, `?` unknown |
+| `S` | status: `⏸` awaiting approval, `●` running, `○` starting, `◌` idle, `✓` done, `✗` failed, `⊘` cancelled, `?` unknown |
 | `STARTED (local)` | first observed delegation/start time as `YYYY-MM-DD HH:MM` in your local timezone; details include seconds and UTC offset |
 | `RUNTIME` | wall clock since the agent was delegated |
 | `QUIET` | time since the last event for this agent — how long you have been waiting |
 | `AGENT` | short `agent_id` (background) or tool call id (sync) |
 | `TYPE` | agent type: `general-purpose`, `code-review`, `research`, `explore`, … |
 | `MOD` | `bg` for background agents, `sync` for blocking delegations |
-| `TOOLS` | total tool calls and the most used tool |
-| `TOKENS` | context / output tokens (shown from 132 columns of width) |
-| `AIU` | AI units consumed by that agent |
+| `MODEL` | current recorded model (shown from 160 columns) |
+| `TOOLS` | reported completion tool count when available, otherwise observed calls; most frequently observed tool |
+| `TOKENS` | `sum N` for reported total input+output usage, otherwise observed context / output; shown from 132 columns |
+| `AIC` | known agent consumption; an authoritative shutdown value replaces observed request sums |
 
 The start column is present in tree, flat and text snapshots. It retains the
 original observed start when a resumable agent receives another turn.
@@ -266,6 +268,50 @@ If earlier log events are missing, it is the earliest start/delegation event
 available to this monitor, not a reconstructed OS process creation time.
 JSON `started_at` remains an ISO-8601 UTC timestamp; unknown timestamps remain
 `null` (shown as `-` in the table). Use `--sort start` for newest-first ordering.
+
+### Agent telemetry and total consumption
+
+Enter opens a scrollable detail view. Missing optional values are omitted,
+not filled with estimates; explicitly reported zero values remain visible.
+
+- **Approval waits:** CLI `permission.requested` / `permission.completed` events
+  produce `waiting` status, permission kind, pending wait time and resolution
+  counts. Requests already resolved by hooks do not appear as user waits.
+  `active` still means running/starting only: use `all` or `2h` to see waiting agents.
+- **Tool results:** successes/failures, last error, pending tools and measured
+  average/maximum durations. Duration requires a matching start and completion.
+  Overlapping calls are independent; summed tool time is not wall-clock runtime.
+- **Model/configuration:** requested and resolved models, first dispatched model,
+  configured preference, override reason, reasoning effort, context tier and
+  multi-turn/resumability flags when recorded. Model changes retain their recorded
+  cause rather than guessing why a switch occurred.
+- **Completion:** reported execution duration, total tokens and total tool calls.
+  These are the latest completion summary, not values added to the observed
+  counters. Native cancellation and errors remain distinct.
+- **Final usage:** `session.shutdown.agentMetrics` supplies authoritative per-agent
+  AIC and token breakdowns when present. Final input+output totals do not add
+  cached or reasoning tokens again. Before such a record, observed AIC is labeled
+  accordingly; it is not presented as final billing. Each shutdown record replaces
+  the previous breakdown instead of mixing values from different snapshots.
+  New work clears stale completion/final-token summaries.
+
+The top-line **AIC total** sums cumulative reported consumption across all loaded
+sessions once, including sessions hidden by display filters. Agent consumption
+is already included and is not added again. **AIC known** means some loaded
+sessions have no reported total, so the sum is incomplete. No total is shown if
+none is known. Source/discovery options still determine which sessions are loaded.
+
+The display uses **AIC** for the consumption units previously labeled AIU.
+The underlying `totalNanoAiu / 1e9` calculation is unchanged; this is not a
+currency conversion or a monetary invoice. Existing JSON `aiu` fields retain
+their names for compatibility.
+
+Availability is source/version-dependent. The public SDK
+[event documentation](https://github.com/github/copilot-sdk/blob/eb38014b8293cb93687dc81212f94a85bed950a8/docs/features/streaming-events.md)
+and [generated schema](https://github.com/github/copilot-sdk/blob/09210291cac77d58bbdf2a0c582fd57dc49cf1d0/nodejs/src/generated/session-events.ts)
+describe these fields, but optional or live-only events need not occur in local
+histories. AHP-only sources provide observed tool/usage data when streamed;
+CLI-native approval/configuration/completion fields are not invented for them.
 
 ## How it works
 
@@ -290,9 +336,9 @@ agents and marks still-running agents as cancelled. Status reflects the recorded
 events, not an OS process-health probe: if a process dies without recording a final
 event, its last observed status can remain visible.
 
-`session.usage_checkpoint` and `session.shutdown` supply cumulative AIU totals.
+`session.usage_checkpoint` and `session.shutdown` supply cumulative AIC totals.
 Model-call events, when recorded, provide token and per-agent usage information.
-CLI turn AIU is the difference from the last cumulative checkpoint available when
+CLI turn AIC is the difference from the last cumulative checkpoint available when
 the user message arrived; delayed checkpoints can make that attribution approximate.
 The self/subagent split is only emitted when a direct-usage total and a matching
 turn baseline are known. Otherwise the JSON fields are `null`, not a guessed split.
@@ -318,7 +364,7 @@ For sessions without an available CLI history, these signals rebuild the lifecyc
 | tools, tokens | `chat/toolCallStart` and `chat/usage` on the agent's own `ahp-chat://subagent/...` channel |
 | session context | `session/metaChanged` (repo, branch), `session/activityChanged`, `chat/usage` |
 
-AIU is derived from `copilotUsage.totalNanoAiu / 1e9`. For the main session that field is
+AIC is derived from `copilotUsage.totalNanoAiu / 1e9`. For the main session that field is
 cumulative per turn, so the maximum is kept and reset on `chat/turnStarted`; for subagents
 it arrives per request and is summed. `directCopilotUsage` gives the share spent by the
 main agent itself, so the panel can split a turn into `self` and `agents`.
@@ -340,6 +386,17 @@ a fast-forward to the application checkout, without reading session logs.
 session object and agent counts. Counts refer
 to the visible agents; `done` counts all terminal agents, including failed and
 cancelled ones. Individual `status` fields preserve these distinctions.
+`counts.waiting` counts visible agents with outstanding approval requests.
+
+Optional per-agent `configuration`, `model_changes`, `completion`, `usage`,
+`tool_stats`, `permissions` and `last_error` fields expose the added telemetry.
+`usage.aic_final` distinguishes authoritative shutdown consumption from observed
+request sums. These optional fields are omitted when unavailable; legacy
+fields keep their existing zero/null behavior for compatibility.
+
+When consumption is known, top-level `totals` contains `aic`, `complete` and
+`scope: "loaded_sessions"`. Unlike filtered agent counts, this total deliberately
+includes hidden loaded sessions.
 
 The snapshot includes:
 
@@ -351,7 +408,7 @@ The snapshot includes:
 
 ## Known limitations
 
-For **AHP-only** sessions, `TOOLS`, `TOKENS` and `AIU` stay empty for a background agent until VS Code
+For **AHP-only** sessions, `TOOLS`, `TOKENS` and `AIC` stay empty for a background agent until VS Code
 subscribes to that agent's channel, which happens when you expand the agent once in the
 chat UI. The host does not stream a subagent's tool events to unsubscribed clients.
 CLI histories can supply tool activity independently of that subscription, but token

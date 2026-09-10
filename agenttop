@@ -32,6 +32,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from datetime import datetime, timezone
@@ -337,6 +338,7 @@ CLI_EVENTS = (
     "tool.execution_start", "tool.execution_complete", "subagent.started",
     "subagent.completed", "subagent.failed", "system.notification", "abort",
     "model.model_call_success",
+    "subagent.configured", "permission.requested", "permission.completed",
 )
 
 AGENT_ID_RE = re.compile(r"agent_id:?\s*`?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
@@ -411,6 +413,16 @@ def text_of(result) -> str:
     return "\n".join(out)
 
 
+def is_metric(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+
+
+def session_status(state):
+    if state.get("permissions") and state["status"] not in ("done", "failed", "cancelled"):
+        return "waiting"
+    return state["status"]
+
+
 class Agent:
     __slots__ = (
         "call_id", "agent_id", "session", "name", "description", "agent_type", "model",
@@ -419,6 +431,10 @@ class Agent:
         "tools", "tool_log", "in_tokens", "out_tokens", "cached_tokens", "cost", "aiu",
         "source",
         "resumable",
+        "configuration", "model_changes", "completion", "usage_totals", "final_aiu", "aiu_known",
+        "pending_tools", "completed_tools", "tool_results", "tool_durations", "tool_samples",
+        "recent_results", "last_error", "permissions", "permission_results", "permission_wait", "tool_max",
+        "last_permission", "tokens_known", "native_terminal",
     )
 
     def __init__(self, call_id, session, started, parent=None):
@@ -450,6 +466,142 @@ class Agent:
         self.aiu = 0.0
         self.source = "vscode"
         self.resumable = True
+        self.configuration = {}
+        self.model_changes = collections.deque(maxlen=10)
+        self.completion = {}
+        self.usage_totals = {}
+        self.final_aiu = None
+        self.aiu_known = False
+        self.tokens_known = False
+        self.pending_tools = {}
+        self.completed_tools = set()
+        self.tool_results = collections.Counter()
+        self.tool_durations = collections.Counter()
+        self.tool_samples = collections.Counter()
+        self.tool_max = collections.Counter()
+        self.recent_results = collections.deque(maxlen=12)
+        self.last_error = ""
+        self.permissions = {}
+        self.permission_results = collections.Counter()
+        self.permission_wait = 0.0
+        self.last_permission = ""
+        self.native_terminal = False
+
+    @property
+    def display_status(self):
+        return "waiting" if self.permissions and self.ended is None else self.status
+
+    @property
+    def aic(self):
+        if self.final_aiu is not None:
+            return self.final_aiu
+        return self.aiu if self.aiu_known or self.aiu else None
+
+    @property
+    def total_tokens(self):
+        if "input_tokens" in self.usage_totals and "output_tokens" in self.usage_totals:
+            return self.usage_totals["input_tokens"] + self.usage_totals["output_tokens"]
+        return self.completion.get("total_tokens")
+
+    def tool_started(self, call, name, ts):
+        if call and (call in self.pending_tools or call in self.completed_tools):
+            return
+        self.last_tool = name
+        self.tools[name] += 1
+        self.tool_log.append((ts, name))
+        if call:
+            self.pending_tools[call] = (name, ts)
+
+    def tool_completed(self, call, ts, success=None, error=""):
+        if not call or call in self.completed_tools:
+            return
+        self.completed_tools.add(call)
+        started = self.pending_tools.pop(call, None)
+        result = {"at": ts}
+        if started:
+            name, when = started
+            duration = max(0.0, ts - when)
+            self.tool_durations[name] += duration
+            self.tool_samples[name] += 1
+            self.tool_max[name] = max(self.tool_max[name], duration)
+            result.update(name=name, duration_seconds=duration)
+        if isinstance(success, bool):
+            result["success"] = success
+            self.tool_results["success" if success else "failed"] += 1
+        if error:
+            result["error"] = str(error)[:1000]
+            if success is False and not self.native_terminal:
+                self.last_error = result["error"]
+        self.recent_results.append(result)
+
+    def model_changed(self, data, ts):
+        model = data.get("newModel")
+        if model:
+            change = {"to": model, "at": ts}
+            previous = data.get("previousModel") or self.model
+            if previous:
+                change["from"] = previous
+            if data.get("cause"):
+                change["cause"] = data["cause"]
+            self.model_changes.append(change)
+            self.model = model
+        for raw, name in (("reasoningEffort", "reasoning_effort"), ("contextTier", "context_tier")):
+            if data.get(raw):
+                self.configuration[name] = data[raw]
+
+    def reported_completion(self, data, ts):
+        self.completion = {"at": ts}
+        for raw, name in (("durationMs", "duration_ms"), ("totalTokens", "total_tokens"),
+                          ("totalToolCalls", "total_tool_calls")):
+            if is_metric(data.get(raw)):
+                self.completion[name] = data[raw]
+        for raw, name in (("configuredModelPreference", "preferred_model"),
+                          ("explicitModelOverride", "requested_model"),
+                          ("firstDispatchedModel", "first_dispatched_model"),
+                          ("modelOverrideReason", "model_override_reason")):
+            if data.get(raw):
+                self.configuration[name] = data[raw]
+        for raw, name in (("configuredModelMatchesActual", "preferred_model_matched"),
+                          ("explicitModelMatchesPreference", "requested_model_matched")):
+            if isinstance(data.get(raw), bool):
+                self.configuration[name] = data[raw]
+        if data.get("error"):
+            self.last_error = str(data["error"])[:1000]
+            self.completion["error"] = self.last_error
+        if isinstance(data.get("cancelled"), bool):
+            self.completion["cancelled"] = data["cancelled"]
+
+    def shutdown_usage(self, metrics):
+        self.usage_totals = {}
+        self.final_aiu = None
+        if is_metric(metrics.get("totalNanoAiu")):
+            self.final_aiu = nano_to_aiu(metrics["totalNanoAiu"])
+            self.aiu, self.aiu_known = self.final_aiu, True
+        if is_metric(metrics.get("totalApiDurationMs")):
+            self.usage_totals["api_duration_ms"] = metrics["totalApiDurationMs"]
+        models = [metric.get("usage") or {} for metric in (metrics.get("modelMetrics") or {}).values()
+                  if isinstance(metric, dict)]
+        for raw, name in (("inputTokens", "input_tokens"), ("outputTokens", "output_tokens"),
+                          ("cacheReadTokens", "cached_tokens"), ("cacheWriteTokens", "cache_write_tokens"),
+                          ("reasoningTokens", "reasoning_tokens")):
+            if models and all(is_metric(usage.get(raw)) for usage in models):
+                self.usage_totals[name] = sum(usage[raw] for usage in models)
+
+    def observed_aic(self, nano):
+        if is_metric(nano):
+            if self.final_aiu is not None:
+                self.usage_totals.clear()
+                self.completion.clear()
+            self.final_aiu = None
+            self.aiu += nano_to_aiu(nano)
+            self.aiu_known = True
+
+    def start_work(self):
+        self.status, self.ended = "running", None
+        self.native_terminal = False
+        self.final_aiu = None
+        self.usage_totals.clear()
+        self.completion.clear()
 
     @property
     def label(self) -> str:
@@ -459,10 +611,13 @@ class Agent:
 
     @property
     def tool_summary(self) -> str:
-        if not self.tools:
-            return "-"
-        top, _ = self.tools.most_common(1)[0]
-        return f"{sum(self.tools.values())} \u00b7 {top}"
+        total = self.completion.get("total_tool_calls")
+        if total is None:
+            total = sum(self.tools.values()) if self.tools else None
+        if total is None:
+            return ""
+        top = self.tools.most_common(1)
+        return f"{total:g}" + (f" \u00b7 {top[0][0]}" if top else " total")
 
     @property
     def short_id(self) -> str:
@@ -472,10 +627,16 @@ class Agent:
         end = self.ended if self.ended is not None else now
         return max(0.0, end - (self.started if self.started is not None else end))
 
-    def finish(self, when, status="done"):
-        if self.ended is None:
+    def finish(self, when, status="done", native=False):
+        if self.native_terminal and not native:
+            return
+        if self.ended is None or native:
             self.ended = when
-        self.status = status
+        if native or status != "done" or self.status not in ("failed", "cancelled"):
+            self.status = status
+        self.native_terminal = native
+        self.permissions.clear()
+        self.pending_tools.clear()
 
     def refresh_status(self, now: float):
         """A `task` call whose launch args/result never showed up (log rotation) is an orphan."""
@@ -495,6 +656,9 @@ class Monitor:
         self.by_agent_id: dict[str, Agent] = {}
         self.pending_reads: dict[str, str] = {}     # read_agent call_id -> agent_id
         self.pending_writes: dict[str, list[str]] = {}
+        self.tool_owners = {}
+        self.pending_permissions = {}
+        self.pending_configuration = {}
         self.sessions: dict[str, dict] = {}
         self.files: list[str] = []
         self.errors: list[str] = []
@@ -598,6 +762,56 @@ class Monitor:
             for key in ("repo", "branch"):
                 state[key] = previous[key]
 
+    @staticmethod
+    def configure_agent(agent, data):
+        if data.get("model"):
+            agent.configuration["configured_model"] = data["model"]
+            agent.model = data["model"]
+        for raw, name in (("reasoningEffort", "reasoning_effort"), ("contextTier", "context_tier")):
+            if data.get(raw):
+                agent.configuration[name] = data[raw]
+        if isinstance(data.get("multiTurn"), bool):
+            agent.configuration["multi_turn"] = data["multiTurn"]
+
+    def on_permission(self, sess, kind, data, owner, aid, ts):
+        request = data.get("requestId")
+        if not isinstance(request, str):
+            self.report_error(f"Permission event without requestId in {sess[:8]}")
+            return
+        key = (sess, request)
+        state = self.sessions[sess]
+        if kind == "permission.requested":
+            if data.get("resolvedByHook") or key in self.pending_permissions:
+                return
+            permission = data.get("permissionRequest") or {}
+            call = permission.get("toolCallId")
+            if owner is None and call:
+                owner = self.tool_owners.get(f"{sess}/{call}")
+            if owner is None and aid:
+                self.report_error(f"Permission event for an unmapped subagent in {sess[:8]}")
+                return
+            if owner is not None and owner.ended is not None:
+                return
+            info = {"kind": permission.get("kind") or "permission", "started": ts}
+            self.pending_permissions[key] = (owner, info)
+            (owner.permissions if owner else state["permissions"])[request] = info
+            if owner:
+                owner.last_event = ts
+        else:
+            pending = self.pending_permissions.pop(key, None)
+            if pending is None:
+                return
+            owner, info = pending
+            (owner.permissions if owner else state["permissions"]).pop(request, None)
+            result = (data.get("result") or {}).get("kind")
+            if owner:
+                owner.last_event = ts
+                if result:
+                    owner.permission_results[result] += 1
+                    owner.last_permission = f"{info['kind']}: {result}"
+                end = min(ts, owner.ended) if owner.ended is not None else ts
+                owner.permission_wait += max(0.0, end - info["started"])
+
     def feed_cli(self, line: str, sess: str):
         if not any(f'"{kind}"' in line for kind in CLI_EVENTS):
             return
@@ -623,8 +837,21 @@ class Monitor:
         state["last_event"] = max(state["last_event"], ts)
         aid = evt.get("agentId")
         owner = self.by_agent_id.get(aid) if isinstance(aid, str) else None
+        if owner is not None and owner.session != sess:
+            owner = None
         raw_call = data.get("toolCallId")
         call = f"{sess}/{raw_call}" if isinstance(raw_call, str) else None
+
+        if kind == "subagent.configured" and aid:
+            if owner:
+                self.configure_agent(owner, data)
+                owner.last_event = ts
+            else:
+                self.pending_configuration[(sess, aid)] = data
+            return
+        if kind in ("permission.requested", "permission.completed"):
+            self.on_permission(sess, kind, data, owner, aid, ts)
+            return
 
         if kind in ("subagent.started", "subagent.completed", "subagent.failed") and call:
             agent = self.agents.get(call)
@@ -642,30 +869,40 @@ class Monitor:
             agent.mode = data.get("executionMode") or agent.mode
             if "resumable" in data:
                 agent.resumable = data["resumable"] is True
+                agent.configuration["resumable"] = agent.resumable
+            parent = self.by_agent_id.get(data.get("parentId"))
+            if agent.parent is None and parent and parent.session == sess:
+                agent.parent = parent.call_id
+            config = self.pending_configuration.pop((sess, aid), None)
+            if config:
+                self.configure_agent(agent, config)
             agent.last_event = ts
             agent.launched = True
+            if kind != "subagent.started":
+                agent.reported_completion(data, ts)
             if kind == "subagent.started":
                 if agent.started is None:
                     agent.started = ts
-                agent.status, agent.ended = "running", None
+                agent.start_work()
             elif kind == "subagent.failed":
-                agent.finish(ts, "failed")
-            elif agent.ended is not None:
+                agent.finish(ts, "failed", native=True)
+            elif data.get("cancelled") is True:
+                agent.finish(ts, "cancelled", native=True)
+            elif agent.native_terminal:
                 return
             elif agent.mode == "background" and agent.resumable:
                 agent.status, agent.ended = "idle", None
             else:
-                agent.finish(ts)
+                agent.finish(ts, native=True)
             return
 
         if kind == "tool.execution_start" and call:
             tool = data.get("toolName") or "?"
             if owner:
                 owner.last_event = ts
-                owner.last_tool = tool
-                owner.tools[tool] += 1
-                owner.tool_log.append((ts, tool))
-                owner.status, owner.ended = "running", None
+                owner.tool_started(call, tool, ts)
+                self.tool_owners[call] = owner
+                owner.start_work()
             elif not aid:
                 state["tools"][tool] += 1
                 state["pending_tools"].add(call)
@@ -678,6 +915,8 @@ class Monitor:
             return
 
         if kind == "tool.execution_complete" and call:
+            owner = owner or self.tool_owners.get(call)
+            self.tool_owners.pop(call, None)
             result = data.get("result") or {}
             error = data.get("error") or {}
             content = result.get("content") or error.get("message") or ""
@@ -689,13 +928,14 @@ class Monitor:
                 state["pending_tools"].discard(call)
             if owner:
                 owner.last_event = ts
+                owner.tool_completed(call, ts, data.get("success"), error.get("message") or error.get("code") or "")
             return
 
         if kind == "system.notification":
             notification = data.get("kind") or {}
             if isinstance(notification, dict) and notification.get("type") == "agent_idle":
                 target = self.by_agent_id.get(notification.get("agentId"))
-                if target:
+                if target and not target.native_terminal:
                     if target.resumable:
                         target.status, target.ended = "idle", None
                     elif target.ended is None:
@@ -710,9 +950,12 @@ class Monitor:
                 owner.last_event = ts
                 if kind == "assistant.message":
                     owner.model = data.get("model") or owner.model
+                elif kind == "session.model_change":
+                    owner.model_changed(data, ts)
                 elif kind in ("assistant.turn_start", "user.message"):
-                    owner.status, owner.ended = "running", None
+                    owner.start_work()
                 elif kind in ("abort", "session.error"):
+                    owner.last_error = str(data.get("message") or data.get("reason") or "")[:1000]
                     owner.finish(ts, "cancelled" if kind == "abort" else "failed")
                 elif kind == "model.model_call_success":
                     self.cli_request_usage(data, owner)
@@ -734,6 +977,7 @@ class Monitor:
             state["turn_started"], state["turn_done"] = ts, None
             state["cli_turn_base"] = state["session_aiu"]
             state["turn_aiu"] = 0.0
+            state["turn_aiu_known"] = False
             state["direct_aiu"] = None
             state["cli_direct_base"] = state["session_direct_aiu"]
             state["session_direct_aiu"] = None
@@ -746,7 +990,10 @@ class Monitor:
         elif kind == "assistant.message":
             state["model"] = data.get("model") or state["model"]
         elif kind in ("session.usage_checkpoint", "session.shutdown"):
-            state["session_aiu"] = max(state["session_aiu"], nano_to_aiu(data.get("totalNanoAiu")))
+            if is_metric(data.get("totalNanoAiu")):
+                state["session_aiu"] = max(state["session_aiu"], nano_to_aiu(data["totalNanoAiu"]))
+                state["session_aiu_known"] = True
+                state["turn_aiu_known"] = True
             state["turn_aiu"] = max(0.0, state["session_aiu"] - state["cli_turn_base"])
             main_metrics = (data.get("agentMetrics") or {}).get("main") or {}
             direct = main_metrics.get("totalNanoAiu")
@@ -768,13 +1015,17 @@ class Monitor:
                 state["model"] = data.get("currentModel") or state["model"]
                 state["in_tokens"] = data.get("currentTokens") or state["in_tokens"]
                 state["pending_tools"].clear()
+                state["permissions"].clear()
+                self.pending_permissions = {key: value for key, value in self.pending_permissions.items()
+                                            if key[0] != sess}
+                self.tool_owners = {key: value for key, value in self.tool_owners.items() if value.session != sess}
                 for agent in self.agents.values():
                     if agent.session == sess and agent.ended is None:
                         agent.finish(ts, "cancelled" if agent.status in ("starting", "running") else "done")
                 for agent_id, metrics in (data.get("agentMetrics") or {}).items():
                     agent = self.by_agent_id.get(agent_id)
-                    if agent and agent.session == sess:
-                        agent.aiu = max(agent.aiu, nano_to_aiu(metrics.get("totalNanoAiu")))
+                    if agent and agent.session == sess and isinstance(metrics, dict):
+                        agent.shutdown_usage(metrics)
         elif kind == "model.model_call_success":
             usage = data.get("responseUsage") or {}
             state["in_tokens"] = usage.get("prompt_tokens") or 0
@@ -791,10 +1042,12 @@ class Monitor:
     @staticmethod
     def cli_request_usage(data, agent):
         usage = data.get("responseUsage") or {}
+        if is_metric(usage.get("prompt_tokens")) or is_metric(usage.get("completion_tokens")):
+            agent.tokens_known = True
         agent.in_tokens = max(agent.in_tokens, usage.get("prompt_tokens") or 0)
         agent.out_tokens += usage.get("completion_tokens") or 0
         agent.cached_tokens = max(agent.cached_tokens, (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
-        agent.aiu += nano_to_aiu((data.get("copilotUsage") or {}).get("total_nano_aiu"))
+        agent.observed_aic((data.get("copilotUsage") or {}).get("total_nano_aiu"))
 
     def report_error(self, message):
         if message not in self.errors and len(self.errors) < 50:
@@ -863,6 +1116,7 @@ class Monitor:
             state["turn_id"] = action.get("turnId")
             state["turn_done"] = None
             state["turn_aiu"] = state["direct_aiu"] = 0.0
+            state["turn_aiu_known"] = False
             state["turn_in"] = state["turn_cached"] = state["turn_out"] = 0
             msg = action.get("message") or {}
             if (msg.get("origin") or {}).get("kind") == "systemNotification":
@@ -894,12 +1148,15 @@ class Monitor:
             "status": "unknown", "title": "", "cwd": "", "tools": collections.Counter(),
             "pending_tools": set(), "cli_turn_base": 0.0,
             "session_direct_aiu": None, "cli_direct_base": None,
+            "session_aiu_known": False, "turn_aiu_known": False, "permissions": {},
         })
 
     @staticmethod
     def on_usage_meta(state, meta):
         """Main-session usage reports cumulative turn totals, so take the maximum."""
         cu = meta.get("copilotUsage") or {}
+        state["turn_aiu_known"] = state["turn_aiu_known"] or is_metric(cu.get("totalNanoAiu"))
+        state["session_aiu_known"] = state["session_aiu_known"] or is_metric(cu.get("sessionTotalNanoAiu"))
         state["turn_aiu"] = max(state["turn_aiu"], nano_to_aiu(cu.get("totalNanoAiu")))
         state["session_aiu"] = max(state["session_aiu"], nano_to_aiu(cu.get("sessionTotalNanoAiu")))
         direct = (meta.get("directCopilotUsage") or {}).get("totalNanoAiu")
@@ -964,6 +1221,10 @@ class Monitor:
             agent.description = args.get("description") or agent.description
             agent.agent_type = args.get("agent_type") or agent.agent_type
             agent.model = args.get("model") or agent.model
+            for raw, name in (("model", "requested_model"), ("reasoning_effort", "reasoning_effort"),
+                              ("context_tier", "context_tier")):
+                if args.get(raw):
+                    agent.configuration[name] = args[raw]
             agent.mode = args.get("mode") or agent.mode
             agent.prompt = args.get("prompt") or agent.prompt
             agent.last_event = ts
@@ -994,10 +1255,15 @@ class Monitor:
             for aid in written:
                 target = self.by_agent_id.get(aid)
                 if target:
-                    target.ended, target.status, target.last_event = None, "running", ts
+                    target.start_work()
+                    target.last_event = ts
 
         agent = self.agents.get(call_id)
         if agent is not None:
+            if agent.native_terminal:
+                agent.result_preview = body[:4000]
+                agent.last_event = ts
+                return
             agent.launched = True
             agent.description = meta.get("subagentDescription") or agent.description
             agent.agent_type = meta.get("subagentAgentName") or agent.agent_type
@@ -1011,7 +1277,10 @@ class Monitor:
             else:
                 agent.mode = agent.mode if agent.mode != "sync" else "sync"
                 agent.result_preview = body[:4000]
-                agent.finish(ts, "failed" if action.get("success") is False else "done")
+                failed = action.get("success") is False or result.get("isError") is True
+                agent.finish(ts, "failed" if failed else "done")
+                if failed and body:
+                    agent.last_error = body[:1000]
             agent.last_event = ts
             return
 
@@ -1023,9 +1292,8 @@ class Monitor:
                 target.last_event = ts
                 low = body[:200].lower()
                 if "still running" in low or "is running" in low:
-                    target.status = "running"
-                    target.ended = None
-                elif "is idle" in low or "waiting for messages" in low:
+                    target.start_work()
+                elif not target.native_terminal and ("is idle" in low or "waiting for messages" in low):
                     target.status = "idle"
                     target.ended = None
                 elif target.ended is None and ("completed" in low or "failed" in low):
@@ -1061,9 +1329,7 @@ class Monitor:
         if kind == "chat/toolCallStart":
             tool = action.get("toolName")
             if tool:
-                agent.last_tool = tool
-                agent.tools[tool] += 1
-                agent.tool_log.append((ts, tool))
+                agent.tool_started(action.get("toolCallId"), tool, ts)
             if tool == "task":                      # this agent delegates further
                 child_id = action.get("toolCallId")
                 if child_id and child_id not in self.agents:
@@ -1071,9 +1337,17 @@ class Monitor:
         elif kind == "chat/toolCallReady":
             self.on_ready(action, ts)
         elif kind == "chat/toolCallComplete":
+            result = action.get("result") or {}
+            success = action.get("success")
+            if not isinstance(success, bool) and isinstance(result.get("isError"), bool):
+                success = not result["isError"]
+            agent.tool_completed(action.get("toolCallId"), ts, success,
+                                 text_of(result) if success is False else "")
             self.on_complete(action, ts)
         elif kind == "chat/usage":
             usage = action.get("usage") or {}
+            if is_metric(usage.get("inputTokens")) or is_metric(usage.get("outputTokens")):
+                agent.tokens_known = True
             agent.model = usage.get("model") or agent.model
             agent.in_tokens = max(agent.in_tokens, usage.get("inputTokens") or 0)
             agent.out_tokens += usage.get("outputTokens") or 0
@@ -1081,7 +1355,7 @@ class Monitor:
             meta = usage.get("_meta") or {}
             agent.cost += meta.get("cost") or 0
             # subagent usage is reported per request, so accumulate it
-            agent.aiu += nano_to_aiu((meta.get("copilotUsage") or {}).get("totalNanoAiu"))
+            agent.observed_aic((meta.get("copilotUsage") or {}).get("totalNanoAiu"))
         elif kind == "session/chatAdded":
             title = (action.get("summary") or {}).get("title")
             if title and not agent.name:
@@ -1106,7 +1380,7 @@ class Monitor:
             "start": lambda a: -(a.started or 0),
             "idle": lambda a: -(now - (a.last_event or now)),
             "name": lambda a: a.label.lower(),
-            "status": lambda a: (STATUS_ORDER.get(a.status, 99), -a.runtime(now)),
+            "status": lambda a: (STATUS_ORDER.get(a.display_status, 99), -a.runtime(now)),
         }
         rows.sort(key=keys.get(sort_key, keys["runtime"]))
         return rows, now
@@ -1122,7 +1396,7 @@ class Monitor:
                 return last_event is not None and last_event >= now - RECENT_ACTIVITY_SECONDS
             return True
 
-        rows = [a for a in rows if matches(a.status, a.last_event)
+        rows = [a for a in rows if matches(a.display_status, a.last_event)
                 and (activity != "active" or a.ended is None)]
         query = query.casefold()
         agent_sessions = {a.session for a in rows}
@@ -1130,7 +1404,7 @@ class Monitor:
             sid for sid, st in self.sessions.items()
             if (not sess_filter or sid.startswith(sess_filter))
             and (show_done or sid in agent_sessions or st["status"] not in ("done", "failed", "cancelled"))
-            and (sid in agent_sessions or matches(st["status"], st["last_event"]))
+            and (sid in agent_sessions or matches(session_status(st), st["last_event"]))
         }
         matching = {
             sid for sid in sessions
@@ -1152,11 +1426,16 @@ class Monitor:
         for a in agents:
             a.refresh_status(now)
         live = [a for a in agents if a.ended is None]
-        running = sum(1 for a in live if a.status == "running")
-        starting = sum(1 for a in live if a.status == "starting")
-        idle = sum(1 for a in live if a.status == "idle")
+        running = sum(1 for a in live if a.display_status == "running")
+        starting = sum(1 for a in live if a.display_status == "starting")
+        idle = sum(1 for a in live if a.display_status == "idle")
         done = sum(1 for a in agents if a.ended is not None)
         return running, starting, idle, done
+
+    def aic_total(self):
+        known = [st["session_aiu"] for st in self.sessions.values()
+                 if st.get("session_aiu_known") or st["session_aiu"]]
+        return (sum(known) if known else None), len(known) == len(self.sessions)
 
 
 def expand_target_list(targets):
@@ -1170,10 +1449,10 @@ def expand_target_list(targets):
 # rendering helpers
 # ---------------------------------------------------------------------------
 
-STATUS_GLYPH = {"running": "\u25cf", "starting": "\u25cb", "idle": "\u25cc",
+STATUS_GLYPH = {"running": "\u25cf", "starting": "\u25cb", "idle": "\u25cc", "waiting": "\u23f8",
                 "done": "\u2713", "failed": "\u2717", "cancelled": "\u2298", "orphan": "?", "unknown": "?"}
-STATUS_ORDER = {status: i for i, status in enumerate(("running", "starting", "idle", "failed", "cancelled", "done", "orphan"))}
-STATUS_LEGEND = " \u25cf running  \u25cb starting  \u25cc idle  \u2713 done  \u2717 failed  \u2298 cancelled  ? unknown "
+STATUS_ORDER = {status: i for i, status in enumerate(("waiting", "running", "starting", "idle", "failed", "cancelled", "done", "orphan"))}
+STATUS_LEGEND = " \u23f8 approval  \u25cf running  \u25cb starting  \u25cc idle  \u2713 done  \u2717 failed  \u2298 cancelled  ? unknown "
 SOURCE_GLYPH = {"cli": ">_", "vscode": "\u25c7"}
 
 
@@ -1206,6 +1485,29 @@ def fmt_aiu(value: float) -> str:
     return f"{value:.2f}"
 
 
+def fmt_aic(value):
+    if value is None:
+        return ""
+    if value == 0:
+        return "0"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.2f}M"
+    if value >= 1000:
+        return f"{value / 1000:.2f}k"
+    if value < 0.0001:
+        return "<0.0001"
+    return f"{value:.4f}" if value < 1 else f"{value:.2f}"
+
+
+def fmt_elapsed(seconds):
+    return f"{seconds * 1000:.0f}ms" if seconds < 1 else (f"{seconds:.2f}s" if seconds < 60 else fmt_dur(seconds))
+
+
+def aic_summary(mon):
+    total, complete = mon.aic_total()
+    return f"AIC {'total' if complete else 'known'} {fmt_aic(total)}" if total is not None else ""
+
+
 def fmt_tokens(n: int) -> str:
     if not n:
         return "-"
@@ -1234,39 +1536,52 @@ def clip(text: str, width: int) -> str:
     return text if len(text) <= width else text[: max(0, width - 1)] + "\u2026"
 
 
-COLS = {"started": 16, "rt": 11, "quiet": 10, "id": 8, "type": 15, "mode": 4, "tools": 13,
+COLS = {"started": 16, "rt": 11, "quiet": 10, "id": 8, "type": 15, "mode": 4, "tools": 13, "model": 16,
         "tok": 12, "aiu": 7}
-WIDE_AT = 132                                       # show TOKENS/AIU columns from here
+WIDE_AT = 132                                       # show TOKENS/AIC columns from here
+MODEL_AT = 160
 
 
 def table_header(width):
     c = COLS
     head = (f"{'S':<2} {'STARTED (local)':<{c['started']}} {'RUNTIME':>{c['rt']}} "
             f"{'QUIET':>{c['quiet']}} {'AGENT':<{c['id']}} "
-            f"{'TYPE':<{c['type']}} {'MOD':<{c['mode']}} {'TOOLS':<{c['tools']}} ")
+            f"{'TYPE':<{c['type']}} {'MOD':<{c['mode']}} ")
+    if width >= MODEL_AT:
+        head += f"{'MODEL':<{c['model']}} "
+    head += f"{'TOOLS':<{c['tools']}} "
     if width >= WIDE_AT:
-        head += f"{'TOKENS in/out':<{c['tok']}} {'AIU':>{c['aiu']}} "
+        head += f"{'TOKENS':<{c['tok']}} {'AIC':>{c['aiu']}} "
     return (head + "TASK")[:max(0, width - 1)]
 
 
 def agent_line(a, now, width, prefix=""):
     c = COLS
-    status = a.status
+    status = a.display_status
     quiet = fmt_dur(now - (a.last_event or now)) if a.ended is None else "-"
     mode = "bg" if a.mode == "background" else "sync"
     text = (
         f"{STATUS_GLYPH.get(status, '?'):<2} {fmt_timestamp(a.started):<{c['started']}} "
         f"{fmt_dur(a.runtime(now)):>{c['rt']}} {quiet:>{c['quiet']}} "
         f"{a.short_id:<{c['id']}} {clip(a.agent_type or '-', c['type']):<{c['type']}} "
-        f"{mode:<{c['mode']}} {clip(a.tool_summary, c['tools']):<{c['tools']}} "
+        f"{mode:<{c['mode']}} "
     )
+    if width >= MODEL_AT:
+        text += f"{clip(a.model, c['model']):<{c['model']}} "
+    text += f"{clip(a.tool_summary, c['tools']):<{c['tools']}} "
     if width >= WIDE_AT:
-        tok = f"{fmt_tokens(a.in_tokens)}/{fmt_tokens(a.out_tokens)}" if a.in_tokens else "-"
-        text += f"{tok:<{c['tok']}} {fmt_aiu(a.aiu):>{c['aiu']}} "
+        if a.total_tokens is not None:
+            tok = f"sum {fmt_tokens(a.total_tokens) if a.total_tokens else '0'}"
+        else:
+            tok = f"{a.in_tokens}/{a.out_tokens}" if a.tokens_known else ""
+            if a.in_tokens or a.out_tokens:
+                tok = f"{fmt_tokens(a.in_tokens)}/{fmt_tokens(a.out_tokens)}"
+        text += f"{tok:<{c['tok']}} {fmt_aic(a.aic):>{c['aiu']}} "
     available = max(0, width - 1 - len(text))
     prefix = prefix[:available]
     task_w = max(0, available - len(prefix))
-    return status, (text + prefix + clip(a.label, task_w))[:max(0, width - 1)]
+    label = ("[approval] " if status == "waiting" else "") + a.label
+    return status, (text + prefix + clip(label, task_w))[:max(0, width - 1)]
 
 
 def build_rows(mon: Monitor, rows, now, width):
@@ -1277,18 +1592,18 @@ def build_rows(mon: Monitor, rows, now, width):
 def session_header(mon: Monitor, sid, kids, now, collapsed, width):
     st = mon.sessions.get(sid, {})
     live = [k for k in kids if k.ended is None]
-    run = sum(1 for k in live if k.status == "running")
+    run = sum(1 for k in live if k.display_status == "running")
     mark = "\u25bc" if sid not in collapsed else "\u25b6"
     turn = ""
     if st.get("turn_started"):
         end = st.get("turn_done") or now
         turn = f"  turn {fmt_dur(end - st['turn_started'])}"
     aiu = ""
-    if st.get("turn_aiu") or st.get("session_aiu"):
-        aiu = f"  \u00b7 AIU {fmt_aiu(st.get('turn_aiu', 0))} turn / {fmt_aiu(st.get('session_aiu', 0))} session"
+    if st.get("session_aiu_known") or st.get("session_aiu"):
+        aiu = f"  \u00b7 AIC {fmt_aic(st.get('session_aiu', 0))} session"
     source = SOURCE_GLYPH.get(st.get("source", "vscode"), "?")
     head = (f"{mark} {source} {mon.session_label(sid)} [{sid[:8]}]"
-            f" {st.get('status', 'unknown')} {st.get('model') or '-'}"
+            f" {session_status(st) if st else 'unknown'} {st.get('model') or ''}"
             f"  \u00b7 {clip(st.get('activity') or st.get('title') or 'idle', 50)}"
             f"  \u00b7 {len(kids)} agents ({len(live)} live, {run} running)"
             f"  \u00b7 {sum(st.get('tools', {}).values())} tools{turn}{aiu}")
@@ -1298,11 +1613,12 @@ def session_header(mon: Monitor, sid, kids, now, collapsed, width):
 def usage_lines(mon: Monitor, width, sessions=None):
     """Per-session token/AIU accounting, the bottom panel of the TUI."""
     candidates = [(sid, st) for sid, st in mon.sessions.items()
-                  if (sessions is None or sid in sessions) and (st["in_tokens"] or st["session_aiu"])]
+                  if (sessions is None or sid in sessions)
+                  and (st["in_tokens"] or st["session_aiu"] or st.get("session_aiu_known"))]
     candidates.sort(key=lambda kv: -kv[1]["last_event"])
     out = []
     for sid, st in candidates[:3]:
-        ctx = f"ctx {fmt_tokens(st['in_tokens'])}"
+        ctx = f"ctx {fmt_tokens(st['in_tokens'])}" if st["in_tokens"] else ""
         if st.get("ctx_limit"):
             ctx += f"/{fmt_tokens(st['ctx_limit'])}"
         if st.get("cached_tokens"):
@@ -1311,11 +1627,12 @@ def usage_lines(mon: Monitor, width, sessions=None):
         if st.get("turn_in"):
             turn_tok = (f"  turn {fmt_tokens(st['turn_in'])} in"
                         f" / {fmt_tokens(st['turn_out'])} out")
-        aiu = f"  AIU turn {fmt_aiu(st['turn_aiu'])}"
+        aiu = f"  AIC turn {fmt_aic(st['turn_aiu'])}" if st.get("turn_aiu_known") or st["turn_aiu"] else ""
         agents_aiu = st["turn_aiu"] - st["direct_aiu"] if st["direct_aiu"] is not None else None
         if st["direct_aiu"] and agents_aiu is not None and agents_aiu > 0.005:
-            aiu += f" (self {fmt_aiu(st['direct_aiu'])} + agents {fmt_aiu(agents_aiu)})"
-        aiu += f"  session {fmt_aiu(st['session_aiu'])}"
+            aiu += f" (self {fmt_aic(st['direct_aiu'])} + agents {fmt_aic(agents_aiu)})"
+        if st.get("session_aiu_known") or st["session_aiu"]:
+            aiu += f"  AIC session {fmt_aic(st['session_aiu'])}"
         quota = f"  premium {st['premium_pct']:.1f}% used" if st.get("premium_pct") is not None else ""
         out.append(clip(f"{sid[:8]} {st['model'] or '-'}  {ctx}{turn_tok}{aiu}{quota}", width))
     return out
@@ -1411,7 +1728,7 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
             curses.init_pair(4, curses.COLOR_BLUE, -1)
             curses.init_pair(5, curses.COLOR_RED, -1)
             curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_WHITE)
-        pairs = {"running": 1, "starting": 2, "idle": 3, "done": 4, "failed": 5, "cancelled": 2}
+        pairs = {"running": 1, "starting": 2, "idle": 3, "done": 4, "failed": 5, "cancelled": 2, "waiting": 2}
 
         show_done = all_done
         current_sort = sort_key
@@ -1423,6 +1740,8 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
         session_focus = sess_filter
         cursor = 0
         detail = None
+        detail_scroll = 0
+        detail_limit = 0
         last_poll = 0.0
         body = []
         search = query
@@ -1441,12 +1760,11 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
             stdscr.erase()
 
             running, starting, idle, done = mon.counts(rows)
-            aiu_total = sum(mon.sessions[s].get("session_aiu", 0.0) for s in sessions)
-            aiu_live = sum(a.aiu for a in rows if a.ended is None)
-            title = f" agenttop {version()}  {datetime.now().strftime('%H:%M:%S')} "
+            total = aic_summary(mon)
+            waiting = sum(a.display_status == "waiting" for a in rows)
+            title = f" agenttop {version()}{' | ' + total if total else ''}  {datetime.now().strftime('%H:%M:%S')} "
             summary = (f" running {running}  starting {starting}  idle {idle}  done {done} "
-                       f" | AIU total {fmt_aiu(aiu_total)}"
-                       f"{f' (live agents {fmt_aiu(aiu_live)})' if aiu_live else ''}"
+                       f" waiting {waiting}"
                        f"  | sessions {len(sessions)}  logs {len(mon.files)}  sort:{current_sort}"
                        f"{'  tree' if tree_mode else '  flat'}  activity:{ACTIVITY_FILTERS[current_activity]}"
                        f"{'  +finished' if show_done else ''}"
@@ -1474,6 +1792,9 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                     f"Sources: {SOURCE_GLYPH['cli']} CLI history, {SOURCE_GLYPH['vscode']} VS Code AHP",
                     "Idle background agents can be resumed with write_agent.",
                     "STARTED is local date/time; agent details show seconds and UTC offset.",
+                    "Approval waits are excluded by 'active'; use 'all' or '2h' to see them.",
+                    "AIC total sums loaded sessions once; 'known' means some session totals are missing.",
+                    "Agent details: Up/Down, Page Up/Down, Home/End scroll through available telemetry.",
                     "--source cli|vscode|all selects the log source at startup.",
                     "Only recorded events are shown; status is not a process health check.",
                     "Updates: checked at startup and every eight hours; --no-update-check disables.",
@@ -1486,7 +1807,7 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                     except curses.error:
                         pass
             elif detail is not None:
-                render_detail(stdscr, detail, height, width)
+                detail_limit = render_detail(stdscr, detail, height, width, detail_scroll)
             else:
                 header, body = build_display(mon, rows, now, width, tree_mode, collapsed, sessions)
                 try:
@@ -1531,7 +1852,7 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
 
             filters = filter_hint(show_done, current_activity)
             if detail is not None or show_help:
-                hint = " q/esc  back "
+                hint = " q/esc  back  \u2191\u2193 / PgUp/PgDn scroll " if detail is not None else " q/esc  back "
             elif editing_search:
                 hint = f" / {search}  [Enter: apply, Esc: clear] "
             elif search:
@@ -1568,6 +1889,14 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
             if detail is not None:
                 if ch in (ord("q"), 27, curses.KEY_LEFT, ord("h"), 10):
                     detail = None
+                elif ch in (curses.KEY_DOWN, ord("j"), curses.KEY_NPAGE):
+                    detail_scroll = min(detail_limit, detail_scroll + (10 if ch == curses.KEY_NPAGE else 1))
+                elif ch in (curses.KEY_UP, ord("k"), curses.KEY_PPAGE):
+                    detail_scroll = max(0, detail_scroll - (10 if ch == curses.KEY_PPAGE else 1))
+                elif ch == curses.KEY_HOME:
+                    detail_scroll = 0
+                elif ch == curses.KEY_END:
+                    detail_scroll = detail_limit
                 continue
             if ch in (ord("q"), ord("Q")):
                 return
@@ -1617,6 +1946,7 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                     collapsed.symmetric_difference_update({obj})
                 else:
                     detail = obj
+                    detail_scroll = 0
             elif ch in (curses.KEY_LEFT, ord('h')) and body:
                 kind, obj = body[min(cursor, len(body) - 1)][:2]
                 if kind == "session":
@@ -1636,96 +1966,141 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
             checker.close()
 
 
-def render_detail(stdscr, agent, height, width):
+def agent_telemetry(agent, now):
+    fields = {}
+    if agent.configuration:
+        fields["configuration"] = dict(agent.configuration)
+    if agent.model_changes:
+        fields["model_changes"] = list(agent.model_changes)
+    if agent.completion:
+        fields["completion"] = dict(agent.completion)
+    usage = dict(agent.usage_totals)
+    if agent.aic is not None:
+        usage.update(aic=agent.aic, aic_final=agent.final_aiu is not None)
+    if agent.total_tokens is not None:
+        usage["total_tokens"] = agent.total_tokens
+    if usage:
+        fields["usage"] = usage
+    if agent.tools or agent.tool_results:
+        fields["tool_stats"] = {
+            "observed_calls": sum(agent.tools.values()), "results": dict(agent.tool_results),
+            "timings": {name: {"samples": agent.tool_samples[name], "total_seconds": duration,
+                               "average_seconds": duration / agent.tool_samples[name],
+                               "max_seconds": agent.tool_max[name]}
+                        for name, duration in agent.tool_durations.items()},
+            "recent_results": list(agent.recent_results),
+        }
+    if agent.permissions or agent.permission_results:
+        fields["permissions"] = {
+            "pending": [{"kind": item["kind"], "started_at": fmt_timestamp(item["started"], precise=True),
+                         "wait_seconds": max(0.0, now - item["started"])}
+                        for item in agent.permissions.values()],
+            "results": dict(agent.permission_results), "recorded_wait_seconds": agent.permission_wait,
+        }
+    if agent.last_error:
+        fields["last_error"] = agent.last_error
+    return fields
+
+
+def detail_entries(agent, now):
+    info = [
+        ("agent_id", agent.agent_id), ("call_id", agent.call_id),
+        ("session", agent.session), ("source", agent.source),
+        ("name", agent.name), ("description", agent.description),
+        ("type", agent.agent_type), ("model", agent.model),
+        ("mode / status", f"{'background' if agent.mode == 'background' else 'sync'} / {agent.display_status}"),
+    ]
+    if agent.permissions:
+        info.append(("awaiting approval", ", ".join(
+            f"{item['kind']} ({fmt_elapsed(max(0.0, now - item['started']))})"
+            for item in agent.permissions.values())))
+    if agent.aic is not None:
+        info.append(("AIC final" if agent.final_aiu is not None else "AIC observed", f"{agent.aic:.4f}"))
+    if agent.total_tokens is not None:
+        info.append(("tokens total", f"{agent.total_tokens:,}"))
+    for key, value in agent.usage_totals.items():
+        info.append((key.replace("_", " "), f"{value:,}"))
+    if agent.completion:
+        info.append(("last completion", fmt_timestamp(agent.completion["at"], precise=True)))
+        for key in ("total_tokens", "total_tool_calls"):
+            if key in agent.completion:
+                info.append(("reported " + key.removeprefix("total_"), f"{agent.completion[key]:,}"))
+        if "duration_ms" in agent.completion:
+            info.append(("reported duration", fmt_elapsed(agent.completion["duration_ms"] / 1000)))
+    if agent.started is not None:
+        info.extend([("started", fmt_timestamp(agent.started, precise=True)),
+                     ("wall runtime", fmt_dur(agent.runtime(now)))])
+    if agent.ended is not None:
+        info.append(("ended", fmt_timestamp(agent.ended, precise=True)))
+    elif agent.last_event is not None:
+        info.append(("quiet since", fmt_dur(now - agent.last_event)))
+    for key, value in agent.configuration.items():
+        info.append((key.replace("_", " "), str(value)))
+    if agent.tokens_known or agent.in_tokens or agent.out_tokens:
+        info.append(("observed ctx/out", f"{agent.in_tokens:,} / {agent.out_tokens:,}"))
+    if agent.cached_tokens:
+        info.append(("observed cached", f"{agent.cached_tokens:,}"))
+    if agent.cost:
+        info.append(("premium reqs", f"{agent.cost:.2f}"))
+    if agent.tools:
+        info.append(("observed tools", ", ".join(f"{name} x{count}" for name, count in agent.tools.most_common())))
+    if agent.tool_results:
+        info.append(("tool outcomes", ", ".join(f"{name}: {count}" for name, count in agent.tool_results.items())))
+    for name, maximum in agent.tool_max.most_common(10):
+        info.append(("tool timing", f"{name}: max {fmt_elapsed(maximum)}, "
+                     f"avg {fmt_elapsed(agent.tool_durations[name] / agent.tool_samples[name])}, "
+                     f"{agent.tool_samples[name]} timed calls"))
+    for call in agent.pending_tools.values():
+        info.append(("tool in progress", f"{call[0]} ({fmt_elapsed(max(0.0, now - call[1]))})"))
+    if agent.permission_results:
+        info.extend([("last permission", agent.last_permission),
+                     ("approval wait", fmt_elapsed(agent.permission_wait)),
+                     ("approval results", ", ".join(f"{key}: {value}" for key, value in agent.permission_results.items()))])
+    if agent.messages or agent.reads:
+        info.append(("write / read", f"{agent.messages} / {agent.reads}"))
+    info.append(("parent agent", agent.parent))
+    info.append(("last error", agent.last_error))
+    for change in agent.model_changes:
+        info.append(("model change", f"{fmt_clock(change['at'])} {change.get('from', '')} -> {change['to']}"
+                     + (f" ({change['cause']})" if change.get("cause") else "")))
+    for result in reversed(agent.recent_results):
+        text = f"{fmt_clock(result['at'])} {result.get('name', 'tool')}"
+        if "success" in result:
+            text += " OK" if result["success"] else " FAILED"
+        if "duration_seconds" in result:
+            text += f" {fmt_elapsed(result['duration_seconds'])}"
+        if result.get("error"):
+            text += f" - {result['error']}"
+        info.append(("recent tool", text))
+    info.extend([("prompt", agent.prompt), ("last result", agent.result_preview)])
+    return [(key, value) for key, value in info if value is not None and value != ""]
+
+
+def render_detail(stdscr, agent, height, width, scroll=0):
     import curses
     if width < 24 or height < 5:
         try:
             stdscr.addnstr(1, 0, "Resize to see details", max(0, width - 1))
         except curses.error:
             pass
-        return
+        return 0
     now = time.time()
-    tools = ", ".join(f"{name} x{cnt}" for name, cnt in agent.tools.most_common(8)) or "-"
-    info = [
-        ("agent_id", agent.agent_id or "(sync task)"),
-        ("session", agent.session),
-        ("source", agent.source),
-        ("name", agent.name or "-"),
-        ("description", agent.description or "-"),
-        ("type / model", f"{agent.agent_type or '-'} / {agent.model or 'inherited'}"),
-        ("mode / status", f"{'background' if agent.mode == 'background' else 'sync'} / {agent.status}"),
-        ("started", fmt_timestamp(agent.started, precise=True)),
-        ("ended", fmt_timestamp(agent.ended, precise=True)),
-        ("runtime", fmt_dur(agent.runtime(now))),
-        ("quiet since", fmt_dur(now - (agent.last_event or now)) if agent.ended is None else "-"),
-        ("tool calls", f"{sum(agent.tools.values())}  ({tools})"),
-        ("tokens", f"ctx {fmt_tokens(agent.in_tokens)}"
-                   + (f" ({fmt_tokens(agent.cached_tokens)} cached)" if agent.cached_tokens else "")
-                   + f"  \u00b7  out {fmt_tokens(agent.out_tokens)}"),
-        ("AIU", f"{agent.aiu:.2f}" if agent.aiu else "-"
-                + ("" if agent.aiu else "  (no usage events captured for this agent)")),
-        ("premium reqs", f"{agent.cost:.2f}" if agent.cost else "-"),
-        ("write / read", f"{agent.messages} / {agent.reads}"),
-        ("parent agent", agent.parent or "(top level)"),
-    ]
-    row = 2
-    for key, value in info:
-        if row >= height - 2:
-            break
-        try:
-            stdscr.addnstr(row, 0, f"  {key:<14}", 18, curses.A_BOLD)
-            stdscr.addnstr(row, 18, clip(str(value), width - 19), width - 19)
-        except curses.error:
-            pass
-        row += 1
-
-    if agent.tool_log and row < height - 8:
-        row += 1
-        try:
-            stdscr.addnstr(row, 0, "  recent tool calls:", width - 1, curses.A_BOLD)
-        except curses.error:
-            pass
-        row += 1
-        for ts, name in list(reversed(agent.tool_log))[:6]:
-            if row >= height - 6:
-                break
-            try:
-                stdscr.addnstr(row, 4, f"{fmt_clock(ts)}  {name}", width - 5, curses.A_DIM)
-            except curses.error:
-                pass
-            row += 1
-
-    for label, blob in (("prompt", agent.prompt), ("last result", agent.result_preview)):
-        if not blob or row >= height - 5:
-            continue
-        row += 1
-        try:
-            stdscr.addnstr(row, 0, f"  {label}:", width - 1, curses.A_BOLD)
-        except curses.error:
-            pass
-        row += 1
-        limit = min(height - 2, row + 8)
+    lines = []
+    for label, value in detail_entries(agent, now):
         wrapped = []
-        for para in blob.splitlines():
-            para = para.rstrip()
-            while len(para) > width - 5:
-                wrapped.append(para[: width - 5])
-                para = para[width - 5:]
-            wrapped.append(para)
-        shown = wrapped[: max(0, limit - row)]
-        for line in shown:
-            try:
-                stdscr.addnstr(row, 4, line, width - 5, curses.A_DIM)
-            except curses.error:
-                pass
-            row += 1
-        if len(wrapped) > len(shown) and row < height - 2:
-            try:
-                stdscr.addnstr(row, 4, f"\u2026 ({len(wrapped) - len(shown)} more lines)",
-                               width - 5, curses.A_DIM)
-            except curses.error:
-                pass
-            row += 1
+        for paragraph in str(value).splitlines():
+            wrapped.extend(textwrap.wrap(paragraph, max(1, width - 22), replace_whitespace=False) or [""])
+        lines.extend((label if i == 0 else "", text) for i, text in enumerate(wrapped))
+    visible = max(1, height - 3)
+    maximum = max(0, len(lines) - visible)
+    scroll = min(maximum, max(0, scroll))
+    for row, (label, text) in enumerate(lines[scroll:scroll + visible], 2):
+        try:
+            stdscr.addnstr(row, 2, clip(label, 18), 18, curses.A_BOLD)
+            stdscr.addnstr(row, 21, text, max(1, width - 22))
+        except curses.error:
+            pass
+    return maximum
 
 
 def run_once(mon: Monitor, show_done: bool, sort_key: str, as_json: bool, tree=True, sess_filter=None, query="",
@@ -1737,14 +2112,15 @@ def run_once(mon: Monitor, show_done: bool, sort_key: str, as_json: bool, tree=T
             "version": version(),
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "logs": mon.files,
-            "counts": dict(zip(("running", "starting", "idle", "done"), mon.counts(rows))),
+            "counts": {**dict(zip(("running", "starting", "idle", "done"), mon.counts(rows))),
+                       "waiting": sum(a.display_status == "waiting" for a in rows)},
             "errors": mon.errors,
             "agents": [
                 {
                     "agent_id": a.agent_id, "call_id": a.call_id, "session": a.session,
                     "parent_call_id": a.parent,
                     "name": a.name, "description": a.description, "agent_type": a.agent_type,
-                    "model": a.model, "mode": a.mode, "status": a.status, "source": a.source,
+                    "model": a.model, "mode": a.mode, "status": a.display_status, "source": a.source,
                     "started_at": datetime.fromtimestamp(a.started, timezone.utc).isoformat() if a.started is not None else None,
                     "ended_at": datetime.fromtimestamp(a.ended, timezone.utc).isoformat() if a.ended is not None else None,
                     "runtime_seconds": round(a.runtime(now), 1),
@@ -1755,13 +2131,14 @@ def run_once(mon: Monitor, show_done: bool, sort_key: str, as_json: bool, tree=T
                     "cached_tokens": a.cached_tokens, "aiu": round(a.aiu, 4),
                     "premium_requests": round(a.cost, 3),
                     "writes": a.messages, "reads": a.reads,
+                    **agent_telemetry(a, now),
                 }
                 for a in rows
             ],
             "sessions": {
                 sid: {
                     "label": mon.session_label(sid), "repo": st.get("repo", ""),
-                    "source": st["source"], "status": st["status"], "title": st["title"],
+                    "source": st["source"], "status": session_status(st), "title": st["title"],
                     "cwd": st["cwd"], "tool_calls": dict(st["tools"]),
                     "last_event_at": datetime.fromtimestamp(st["last_event"], timezone.utc).isoformat(),
                     "branch": st.get("branch", ""), "activity": st["activity"], "model": st["model"],
@@ -1780,12 +2157,18 @@ def run_once(mon: Monitor, show_done: bool, sort_key: str, as_json: bool, tree=T
                 for sid, st in mon.sessions.items() if sid in sessions
             },
         }
+        total, complete = mon.aic_total()
+        if total is not None:
+            payload["totals"] = {"aic": total, "complete": complete, "scope": "loaded_sessions"}
         json.dump(payload, sys.stdout, indent=2)
         print()
         return
     width = min(200, shutil.get_terminal_size((120, 24)).columns)
     running, starting, idle, done = mon.counts(rows)
-    print(f"agenttop {version()}  running {running}  starting {starting}  idle {idle}  done {done}"
+    total = aic_summary(mon)
+    waiting = sum(a.display_status == "waiting" for a in rows)
+    print(f"agenttop {version()}{' | ' + total if total else ''}"
+          f"  running {running}  starting {starting}  idle {idle}  done {done}  waiting {waiting}"
           f"  | sessions {len(sessions)}  logs {len(mon.files)}"
           f"  | activity:{ACTIVITY_FILTERS[activity]} finished:{'show' if show_done else 'hide'}")
     header, body = build_display(mon, rows, now, width, tree, set(), sessions)

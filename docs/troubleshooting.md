@@ -65,7 +65,7 @@ there, or run the TUI inside WSL. On macOS/Linux, check that the selected Python
 distribution provides `curses` and that you are running in an actual terminal.
 
 Use a UTF-8-capable terminal for status symbols and tree drawing. Resize a very
-small terminal; token/AIU columns need at least 132 columns.
+small terminal; token/AIC columns need at least 132 columns, and models need 160.
 Redirected output is deliberately a snapshot, not an interactive display.
 
 ## Status, runtime or usage looks wrong
@@ -79,8 +79,16 @@ Redirected output is deliberately a snapshot, not an interactive display.
 - CLI token/cost details depend on the events persisted by that CLI version.
 - CLI turn totals depend on available cumulative checkpoints; delayed checkpoints
   make turn-level attribution approximate.
+- Completion summaries, shutdown usage and observed tool/token data describe
+  different scopes; they are displayed separately and are not added together.
+- The global AIC total includes loaded sessions hidden by display filters.
+  `AIC known` means some session totals are unavailable, not a complete bill.
+- `waiting` agents need approval and are excluded by `--activity active`;
+  use `--activity all` or `recent` to find them.
 
 Blank metrics or unknown attribution are not proof of zero usage.
+Optional missing detail fields are hidden. Scroll the agent detail view with
+Up/Down or Page Up/Down to see known values below the first screen.
 Check `errors` in JSON and any terminal warnings before trusting completeness.
 Changing an interval or source filter cannot recover events that were never logged.
 

@@ -29,14 +29,15 @@ reading session logs. See [updating](installation.md#updating).
 
 ## Reading the display
 
-- **Header:** local program version, visible agent counts, session count,
+- **Header:** local program version, total known AIC, visible agent counts, session count,
   number of input logs, sort order and display mode. The top-right corner shows
   update availability independently of the left-hand statistics.
 - **Session rows:** data source, project/directory label, shortened session ID,
   recorded status, model, activity/title and available usage.
 - **Agent rows:** recorded lifecycle state, local start date/time, runtime,
   quiet time, shortened ID, agent type, execution mode and tool activity.
-- **Wide terminals:** token and AIU columns appear at 132 columns or more.
+- **Wide terminals:** token and AIC columns appear at 132 columns or more;
+  the current model column appears at 160 columns.
 - **Footer:** usage for up to three matching sessions with usage data, plus
   read/parse warnings and update-check details when present.
 
@@ -134,6 +135,7 @@ The flat view contains agents only.
 | --- | --- |
 | `starting` | A delegation was observed but launch is not yet confirmed |
 | `running` | The latest relevant events indicate active work |
+| `waiting` | An unresolved approval request is recorded; excluded by the strict active filter |
 | `idle` | Waiting between turns; a resumable agent can be used again |
 | `done` | Completion recorded for a terminal agent/session |
 | `failed` | A failure was recorded |
@@ -160,6 +162,50 @@ Use `--sort start` (or cycle `s` to `start`) to list newest agents first.
 One-shot background agents finish when completion is recorded. Resumable agents
 can become idle and return to running on an accepted follow-up message.
 Process crashes without final log events can leave stale-looking states.
+
+## Detailed agent information
+
+Select an agent and press Enter. Use Up/Down or `j`/`k`, Page Up/Down and
+Home/End to scroll; `q` or Escape returns to the overview.
+Unavailable optional fields are hidden, while explicitly reported zeros are
+retained.
+
+The view includes available model/configuration details, current permission
+requests, resolution counts and recorded waiting time, tool outcomes, recent
+errors, and average/maximum observed tool-call durations. A pending permission
+shows the pause symbol (U+23F8) in the overview. Hook-resolved permissions do not
+create a user-wait state. Missing start/completion pairs never produce guessed
+timings.
+
+Reported completion totals are kept separate from observed counters.
+`sum N` in the token column means total input+output usage from a reported
+summary or final per-agent breakdown, not context-window size. Otherwise the
+column retains the observed context/output format.
+
+The configuration distinguishes the parent's requested model, resolved model,
+first dispatched model and any recorded fallback/override reason. Reasoning
+effort, context tier and multi-turn flags appear only when supplied by the log.
+
+### AIC accounting
+
+`AIC final` in agent details comes from a per-agent shutdown metric and replaces,
+rather than adds to, the observed request sum. `AIC observed` is the recorded
+request sum when no final metric exists. Final token breakdowns are aggregated
+per model only where each model reports the relevant field; cache/reasoning
+tokens are not added again to input+output totals.
+Successive shutdown records replace the previous breakdown. When an agent resumes,
+old completion and final-token summaries are cleared rather than shown as current.
+Native terminal outcomes and diagnostics take precedence over late outer task
+results.
+
+The top-line total sums known cumulative session usage **across all loaded
+sessions**, independent of activity/search/finished filters. Do not add the
+agent values on top: they are already included in their session totals.
+`AIC known` indicates incomplete coverage; if no session total is available,
+the aggregate is omitted. These units are not a monetary invoice.
+
+The display name is AIC; persisted `totalNanoAiu` data is still divided by one
+billion, and legacy JSON `aiu` keys remain unchanged.
 
 ## Custom log locations
 
@@ -195,17 +241,21 @@ Top-level fields:
 | `version` | Local revision/fingerprint and any dirty/shallow marker |
 | `generated_at` | UTC snapshot timestamp |
 | `logs` | Local source file paths |
-| `counts` | Visible running, starting, idle and terminal agent counts |
+| `counts` | Visible running, starting, idle, approval-waiting and terminal agent counts |
 | `agents` | Agent state, identifiers, timing, source, tools and usage |
 | `sessions` | Session-ID-keyed metadata, status and usage |
 | `errors` | Read/parse warnings; check this before treating a snapshot as complete |
+| `totals` | When known: AIC sum, completeness flag and scope `loaded_sessions`, including hidden sessions |
 
 `counts.done` includes failed and cancelled agents. Inspect each agent's `status`
 when the distinction matters.
 
 Missing self/subagent cost attribution is represented as `null`, not an estimated
 split. Other missing numerical metrics may remain zero; zero is not proof of free
-usage. AIU are usage units, not a monetary bill. See
+usage. New optional agent telemetry objects (`configuration`, `completion`,
+`usage`, `tool_stats`, `permissions`, `model_changes`) are omitted when unavailable.
+`usage.aic_final` indicates authoritative shutdown consumption.
+AIC are usage units, not a monetary bill. See
 [accounting details](../README.md#how-it-works).
 
 **Treat snapshots and screenshots as private:** paths, titles, activity,
