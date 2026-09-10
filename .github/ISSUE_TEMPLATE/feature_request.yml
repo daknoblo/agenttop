@@ -1,0 +1,16 @@
+name: Feature request
+description: Suggest a useful improvement to agenttop.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What would you like to improve?
+      description: Describe the workflow or problem, not just the proposed implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Suggested behavior or example
+      description: A short example or mockup is welcome.

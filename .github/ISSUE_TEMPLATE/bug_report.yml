@@ -1,0 +1,45 @@
+name: Bug report
+description: Report something that is not working as expected.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        A small reproducible example helps. Replace real project/session details with examples rather than attaching complete Copilot histories.
+        For a security-sensitive issue, use the reporting instructions in SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: agenttop version
+      description: Output of agenttop --version.
+      placeholder: r12.0123abcd
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - macOS
+        - Linux
+        - Windows with WSL
+        - Native Windows (text/JSON)
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Python and terminal
+      placeholder: Python 3.14, terminal application/version
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: What happened and how can we reproduce it?
+      description: Include the command/options used and the expected result.
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Relevant output or screenshot
+      description: Optional short error output or an example screenshot.

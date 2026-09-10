@@ -1,5 +1,7 @@
 # agenttop
 
+[![Checks](https://github.com/daknoblo/agenttop/actions/workflows/checks.yml/badge.svg)](https://github.com/daknoblo/agenttop/actions/workflows/checks.yml)
+
 **See what your Copilot agents are doing, what they are waiting for, and what they have consumed.**
 
 agenttop is an `htop`-style terminal dashboard for **GitHub Copilot CLI and VS Code
@@ -121,6 +123,13 @@ make check
 `make check` also checks syntax and creates a local JSON snapshot.
 Set `PYTHON=/path/to/python3` when using a specific interpreter.
 
+GitHub Actions runs the existing checks on pushes to `main` and on PRs, using
+Python 3.9 and 3.14 on Linux. Direct maintainer pushes remain supported.
+See [Contributing](CONTRIBUTING.md) for the lightweight workflow and
+[Security](SECURITY.md) for security-sensitive reports.
+
 ## License
 
 [MIT](LICENSE)
+
+agenttop is an independent project, not an official GitHub product.
