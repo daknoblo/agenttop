@@ -1,314 +1,228 @@
 # User guide
 
-[Back to README](../README.md) | [Installation](installation.md) | [Troubleshooting](troubleshooting.md)
+[Overview](../README.md) | [Installation](installation.md) | [Reference](reference.md) | [Troubleshooting](troubleshooting.md)
 
-## Quick start
-
-Launch `agenttop` in an interactive terminal on macOS, Linux or WSL.
-The default view combines locally available Copilot CLI histories and VS Code
-AHP logs modified within the last 24 hours.
+## Open the dashboard
 
 ```sh
 agenttop
-agenttop --once
-agenttop --json
 ```
 
-The first command is interactive; the other two take one snapshot and exit.
-When standard output is redirected, the program defaults to a text snapshot.
-Use `--json` explicitly for structured output.
+The default view combines local Copilot CLI and VS Code sources, groups agents
+by session, and hides finished entries. New agents and events appear as logs
+are updated.
 
-Session monitoring reads files only. It does not contact Copilot, execute agent
-tasks, subscribe to VS Code channels or modify session history.
-The TUI additionally checks the configured Git remote at startup and every
-eight hours without changing program files; disable this with
-`agenttop --no-update-check`. Snapshot modes do not perform that check.
-The separate `agenttop -update` / `agenttop --update` mode fetches the configured
-Git remote and fast-forwards the application checkout, then exits without
-reading session logs. See [updating](installation.md#updating).
+[![Synthetic dashboard showing a task tree, an input request, an approval wait and completed tasks](images/overview.png)](images/overview.png)
 
-## Reading the display
+*This example has finished entries enabled. The actual TUI was captured with
+generated sessions in an isolated demo workspace and update checking disabled.*
 
-- **Header:** local program version, total known AIC, visible agent counts, session count,
-  number of input logs, sort order and display mode. The top-right corner shows
-  update availability independently of the left-hand statistics.
-- **Session rows:** project/branch, source symbol, short session ID where space
-  permits, a compact activity summary and session AIC. Models, tool totals,
-  turn duration and long activity descriptions are no longer repeated here.
-  The summary counts displayed agents (active = running/starting); with no
-  displayed agents it shows the session's own status. Full metadata remains in JSON.
-- **Agent rows:** status, then the **task on the left**, including its nested
-  delegation tree; followed by local start time, runtime, quiet time, ID, type,
-  execution mode, model and metrics as space permits.
-- **Wide terminals:** token and AIC columns appear at 132 columns or more;
-  the current model column appears at 160 columns.
-- **Footer:** usage for up to three matching sessions with usage data, plus
-  read/parse warnings and update-check details when present.
+## Read the overview
 
-Unselected session headers use a subtle cyan underline instead of bright bars
-of different lengths. The selected row has the same full-width highlight whether
-it is a session or an agent. In monochrome terminals, selection uses reverse video.
-Numeric columns are right-aligned and separated from neighboring fields.
-Vertical separators remain present when values are missing, preventing numbers
-or model names in neighboring rows from appearing to belong to another column.
-Terminals at least 200 columns wide use wider model, tool, type and usage fields.
-Magenta highlights a session or agent that needs an answer. An affected group
-also highlights when a displayed child is waiting, even while collapsed.
-The keyboard symbol (U+2328) and `INPUT` text make this recognizable without color.
+### Header
 
-As the terminal narrows, lower-priority columns disappear to preserve room for
-the task description. Widen the terminal or open details to see hidden values.
-Clipping and padding account for common wide characters and combining accents;
-complex emoji rendering can still vary with the terminal and font.
+The top line shows the running version, known AIC consumption and agent counts.
+The top-right corner shows the update-check result.
 
-`EXEC` (formerly `MOD`) is the execution mode: `background` or, in compact
-layouts, `bg` means the caller can continue while the agent runs; `sync` means
-the caller waits for its result. `MODEL` is the language model used by that
-agent. These are independent properties. Session summaries no longer repeat
-the model; it remains in the agent table and detail view.
-The JSON `mode` and `model` fields are unchanged.
+An **`INPUT N`** badge means a loaded session or agent needs an answer.
+The badge includes targets hidden by display filters.
 
-When the header says `Update: agenttop -update`, quit with `q`, run
-`agenttop -update`, then start the monitor again. `Up to date` refers to the
-last successful check, not a continuous live comparison. A failed check is
-shown explicitly rather than treated as "no update"; retries occur after eight
-hours. Local-only commits and rewritten history are distinguished from an
-available fast-forward update.
+### Session groups
 
-The `>_` symbol means the session is reconstructed from a CLI-format `events.jsonl`;
-it does not prove the session was started from a terminal. VS Code can persist
-the same format. If both formats are available, the CLI history supplies state
-and AHP can supplement repository/branch information.
-The white diamond (U+25C7) denotes an AHP-only VS Code source. Press `?` for the
-symbol legend. Agent details and JSON keep the text names `cli` and `vscode`;
-no special icon font is required.
+A group heading contains the project/branch, source symbol, a short session ID
+when space permits, an activity summary and the session's AIC consumption.
 
-## Find the work you need
+The summary counts the displayed agents: active means running or starting.
+If no agents are displayed, the heading shows the session's own status.
+Select a group and press Enter to collapse or expand it.
 
-```sh
-agenttop --source cli
-agenttop --source vscode
-agenttop --session aaaaaaaa
-agenttop --search parser
-agenttop --sort idle
-agenttop --sort start
-agenttop --all-done
-agenttop --activity active
-agenttop --activity recent --all-done
-```
+Source symbols identify the recorded format, not necessarily the application
+that launched the chat:
 
-`aaaaaaaa` is an illustrative ID prefix, not a real session.
-Search is case-insensitive and matches session labels/titles, model names,
-agent descriptions/names, agent type and identifiers.
+| Symbol | Source |
+| --- | --- |
+| `>_` | Copilot CLI-format session history |
+| White diamond (`U+25C7`) | VS Code AHP trace without a matching CLI history |
 
-### Reduce inactive and finished entries
+VS Code can also produce CLI-format histories. For matching session IDs,
+agenttop prefers the CLI history and supplements it with AHP metadata and UI
+input requests.
 
-Use the bottom controls to combine two independent filters:
+### Agent rows
 
-| Control | States | Behavior |
+The task and its nested delegation tree are on the left. Timing, execution and
+usage columns follow. Vertical separators retain the position of empty fields.
+
+| Column | Meaning |
+| --- | --- |
+| `S` | Recorded lifecycle or waiting state |
+| `TASK` | Task description and child-agent hierarchy |
+| `STARTED (local)` | First observed delegation/start, in local date and time |
+| `RUNTIME` | Wall-clock time since the observed start |
+| `QUIET` | Time since the last recorded event |
+| `AGENT` | Short agent or call identifier |
+| `TYPE` | Agent type, such as `explore` or `code-review` |
+| `EXEC` | `background`/`bg`, or blocking `sync` execution |
+| `MODEL` | Recorded language model |
+| `TOOLS` | Reported completion count when available, otherwise observed calls |
+| `TOKENS` | Observed context/output, or `sum N` for reported total usage |
+| `AIC` | Known per-agent consumption |
+
+`EXEC` and `MODEL` are independent: background describes how the agent runs,
+while the model describes which language model it uses.
+
+Columns adapt to the window. Token/AIC columns appear from 132 columns, models
+from 160, and wider fields from 200. Less important columns are hidden when
+needed to leave room for the task. Open details for the full available values.
+
+## Recognize states and colors
+
+| State | Meaning |
+| --- | --- |
+| `starting` | Delegation observed; launch not yet confirmed |
+| `running` | Latest events indicate active work |
+| `idle` | Waiting between turns; may accept follow-up work |
+| `input` | Needs an answer in Copilot/VS Code; magenta with `INPUT` and a keyboard symbol |
+| `waiting` | Needs permission approval; yellow with a pause symbol |
+| `done` | Successful completion recorded |
+| `failed` | Failure recorded |
+| `cancelled` | Cancellation recorded or active work closed at session shutdown |
+| `unknown` / orphan | Insufficient events to reconstruct the state |
+
+The selected row is highlighted across its full width. Normal session headings
+are cyan and underlined. A group also turns magenta when a displayed child needs
+input, even if the group is collapsed.
+
+For `INPUT`, answer in the original chat. agenttop shows the wait but does not
+submit the response. Ordinary client-side tool execution is not automatically
+classified as a question.
+
+Runtime and quiet time are not CPU measurements. An idle resumable agent keeps
+its original start time. A crash without a final event can leave the last
+recorded status visible.
+
+## Find relevant work
+
+### Activity and finished entries
+
+The footer shows two independent filters:
+
+| Control | Values | Effect |
 | --- | --- | --- |
-| `d finished` | `hide` / `show` | Hide or include done, failed and cancelled agents/sessions |
-| `a activity` | `all` / `active` / `2h` | No activity restriction / running and starting only / last recorded event within two hours |
-
-`active` deliberately **excludes idle** agents, including resumable ones.
-It does not require recent events: an agent still marked running remains visible.
-`2h` is based on `last_event`, not delegation time, and can therefore include
-recently idle or completed work. Finished entries still require `d finished:show`.
-The two-hour boundary is inclusive and advances with the clock.
-
-Examples:
+| `a activity` | `all`, `active`, `2h` | No activity restriction; running/starting only; last event within two hours |
+| `d finished` | `hide`, `show` | Hide or include done, failed and cancelled entries |
 
 ```sh
 agenttop --activity active
 agenttop --activity recent
 agenttop --activity recent --all-done
+```
+
+`active` excludes idle, input-waiting and approval-waiting agents.
+`2h` uses the last recorded event, not the start time, and can include idle work.
+Finished entries still require `d finished:show` or `--all-done`.
+
+To find a hidden input request, cycle `a` back to `all`. Its header badge remains
+visible even if the current filter excludes the row.
+
+### Search, source and session
+
+```sh
+agenttop --search parser
+agenttop --source cli
+agenttop --source vscode
+agenttop --session aaaaaaaa
+```
+
+`aaaaaaaa` is an example ID prefix. Search is case-insensitive and covers task
+names/descriptions, types, models and session identifiers/labels.
+Press `/` to edit it, Enter to apply and Escape to clear.
+Press `f` to cycle session focus, including a return to all sessions.
+
+All filters combine. A matching child keeps its session visible for context.
+Sessions without matching children must satisfy the activity filter themselves.
+
+### Sort and change view
+
+```sh
+agenttop --sort start
+agenttop --flat
+```
+
+Press `s` to cycle runtime, start, quiet/idle time, status and name sorting.
+`start` shows the newest agents first. Press `t` to switch tree/flat view.
+The flat view contains agents only; session-only work remains visible in the tree.
+
+## Inspect an agent
+
+Select an agent and press Enter.
+
+[![Synthetic agent detail view with final AIC, token totals, model configuration and tool timings](images/agent-details.png)](images/agent-details.png)
+
+*A completed demo agent with a reported final breakdown. Scroll for additional
+tool history and result details.*
+
+Use Up/Down or `j`/`k`, Page Up/Down and Home/End to scroll.
+Press `q`, Escape or Left to return.
+
+Depending on the recorded events, details include:
+
+- Full IDs, start/end timestamps with seconds and UTC offset.
+- Pending questions and approvals, their waiting time and recorded outcomes.
+- Requested, configured and dispatched models, model-change reasons,
+  reasoning effort, context tier and multi-turn settings.
+- Observed tool calls, failures, recent results and measured average/maximum duration.
+- Reported completion duration, total tool calls and total tokens.
+- Final per-agent AIC and token breakdowns, when available.
+
+Unavailable optional values are omitted; explicitly reported zeros remain visible.
+Some fields require the CLI history or a subscribed AHP subagent channel.
+
+## Understand consumption
+
+- **AIC total** sums reported cumulative usage across all loaded sessions,
+  including sessions hidden by filters.
+- **AIC known** means some session totals are missing; the sum is incomplete.
+- **AIC observed** in details is accumulated recorded request usage.
+- **AIC final** is an authoritative per-agent shutdown value, replacing the
+  observed sum rather than being added to it.
+
+Subagent usage is already included in session consumption, so it is not added
+again to the header total.
+
+`sum N` tokens are a reported input+output total, not context-window size.
+Cache and reasoning counts are not added again. The underlying AIC calculation
+is `totalNanoAiu / 1e9`; it is not a monetary invoice.
+
+See the [accounting reference](reference.md#usage-accounting) for exact scopes.
+
+## Take a snapshot
+
+```sh
+agenttop --once
+agenttop --json
 agenttop --json --activity recent --hide-done
 ```
 
-`--activity all` is the default. `--all-done` and `--hide-done` are mutually
-exclusive. TUI/text hide finished entries by default; JSON includes them by
-default unless explicitly hidden or excluded by the activity filter.
-The controls describe current state, not a deletion action.
+Snapshot modes exit after one read. Redirected standard output also defaults
+to a text snapshot; select `--json` explicitly for structured output.
+JSON includes finished entries by default unless hidden or filtered out.
 
-Session rows without matching children must match the activity filter themselves.
-Sessions with matching agents stay visible even if the session's own status or
-last event would otherwise exclude it. Search and session focus still apply.
-Header counts refer to the filtered agents, not hidden work.
+See [JSON output](reference.md#json-output) for field definitions.
 
-In the TUI:
+## Keyboard reference
 
 | Key | Action |
 | --- | --- |
-| Up/Down or `k`/`j` | Move selection |
-| Enter | Expand/collapse a session or open agent details |
-| `q` | Close details/help, or quit the main view |
-| `/` | Edit the live search text; Enter finishes editing |
-| Escape | Clear search; leave detail/help when open |
-| `f` | Cycle session focus, then return to all sessions |
-| `d` | Show/hide done, failed and cancelled sessions and agents |
-| `a` | Cycle all / active (running+starting) / last activity within 2h |
-| `s` | Cycle runtime, start, idle, status and name sorting |
-| `t` | Toggle session tree / flat agent list |
-| `r` | Force an immediate refresh and source discovery |
-| `?` | Open keyboard help |
-| Page Up/Down, Home/End | Navigate longer lists |
-
-Use the tree view to see sessions that have not delegated any tasks.
-The flat view contains agents only.
-
-## Status and time
-
-| State | Interpretation |
-| --- | --- |
-| `starting` | A delegation was observed but launch is not yet confirmed |
-| `running` | The latest relevant events indicate active work |
-| `waiting` | An unresolved approval request is recorded; excluded by the strict active filter |
-| `input` | An answer is needed in Copilot/VS Code; magenta, also excluded by the strict active filter |
-| `idle` | Waiting between turns; a resumable agent can be used again |
-| `done` | Completion recorded for a terminal agent/session |
-| `failed` | A failure was recorded |
-| `cancelled` | Cancellation observed, or an active CLI agent closed at session shutdown |
-| `unknown` / orphan | Insufficient events to reconstruct state reliably |
-
-Runtime is wall-clock time since delegation, not CPU time. It continues for idle
-resumable agents until they are closed. Quiet time is the time since the last
-recorded event, not proof that the underlying process is hung.
-
-The `STARTED (local)` column shows `YYYY-MM-DD HH:MM` in the monitor's local
-timezone, including the date for agents that have been running across days.
-Open agent details with Enter for seconds and an explicit UTC offset; the
-completion timestamp there also includes its full date. Text snapshots and
-both tree/flat views use the same start column. On narrow terminals, optional
-columns are hidden and remaining fields clipped so rows do not wrap.
-
-This timestamp is the first observed delegation/start, not an OS process
-creation measurement. A resumed agent keeps its original start. If the log
-starts mid-session, earlier history cannot be inferred. An unavailable timestamp
-is `-` in the table and `null` in JSON; `started_at` in JSON otherwise stays UTC.
-Use `--sort start` (or cycle `s` to `start`) to list newest agents first.
-
-One-shot background agents finish when completion is recorded. Resumable agents
-can become idle and return to running on an accepted follow-up message.
-Process crashes without final log events can leave stale-looking states.
-
-## Detailed agent information
-
-Select an agent and press Enter. Use Up/Down or `j`/`k`, Page Up/Down and
-Home/End to scroll; `q` or Escape returns to the overview.
-Unavailable optional fields are hidden, while explicitly reported zeros are
-retained.
-
-The view includes available model/configuration details, current permission
-requests, resolution counts and recorded waiting time, tool outcomes, recent
-errors, and average/maximum observed tool-call durations. A pending permission
-shows the pause symbol (U+23F8) in the overview. Hook-resolved permissions do not
-create a user-wait state. Missing start/completion pairs never produce guessed
-timings.
-
-### Questions that need your answer
-
-User questions are separate from permission approvals. A magenta `INPUT` marker
-means a dedicated question/input request is unresolved. The detail view shows
-how long an agent has been waiting. Complete the answer in the originating
-Copilot/VS Code chat; agenttop never submits answers.
-
-The top `INPUT N` badge counts all loaded waiting sessions and agents, even if
-activity/search filters hide their rows. Set `a activity:all` to find them.
-A group may highlight because one of its children needs input; this does not
-mean the main agent is also blocked. Each waiting target is counted once.
-
-The parser uses dedicated CLI/SDK/VS Code request and completion signals, not
-the text of an activity message. A stale `ask_user` activity label alone is
-therefore not considered a pending question. Native input completion can be
-live-only in SDK versions; a matching question-tool completion can also resolve
-the wait. Missing completion/history records can still leave a pending state.
-Ordinary VS Code client-tool execution is not treated as user input.
-
-Reported completion totals are kept separate from observed counters.
-`sum N` in the token column means total input+output usage from a reported
-summary or final per-agent breakdown, not context-window size. Otherwise the
-column retains the observed context/output format.
-
-The configuration distinguishes the parent's requested model, resolved model,
-first dispatched model and any recorded fallback/override reason. Reasoning
-effort, context tier and multi-turn flags appear only when supplied by the log.
-
-### AIC accounting
-
-`AIC final` in agent details comes from a per-agent shutdown metric and replaces,
-rather than adds to, the observed request sum. `AIC observed` is the recorded
-request sum when no final metric exists. Final token breakdowns are aggregated
-per model only where each model reports the relevant field; cache/reasoning
-tokens are not added again to input+output totals.
-Successive shutdown records replace the previous breakdown. When an agent resumes,
-old completion and final-token summaries are cleared rather than shown as current.
-Native terminal outcomes and diagnostics take precedence over late outer task
-results.
-
-The top-line total sums known cumulative session usage **across all loaded
-sessions**, independent of activity/search/finished filters. Do not add the
-agent values on top: they are already included in their session totals.
-`AIC known` indicates incomplete coverage; if no session total is available,
-the aggregate is omitted. These units are not a monetary invoice.
-
-The display name is AIC; persisted `totalNanoAiu` data is still divided by one
-billion, and legacy JSON `aiu` keys remain unchanged.
-
-## Custom log locations
-
-```sh
-agenttop --cli-dir /path/to/session-state
-agenttop --log /path/to/session/events.jsonl
-agenttop --log /path/to/ahp-log.jsonl --log /path/to/session-state
-agenttop --max-age 72 --interval 2
-```
-
-`--cli-dir` is a root containing per-session directories. `--log` accepts files
-or recursively searched directories, is repeatable, and replaces automatic
-discovery. Explicit log inputs are not restricted by `--max-age`.
-
-Existing files are read incrementally. New-file discovery normally happens
-every five seconds even if `--interval` is shorter.
-
-## JSON snapshots
-
-```sh
-agenttop --json --source cli --session aaaaaaaa > snapshot.json
-```
-
-JSON includes finished entries by default; `--hide-done` excludes them.
-Activity, session and text filters apply to the session object, agents array
-and agent counts. `logs` describes the input
-files independently of the display filter.
-
-Top-level fields:
-
-| Field | Contents |
-| --- | --- |
-| `version` | Local revision/fingerprint and any dirty/shallow marker |
-| `generated_at` | UTC snapshot timestamp |
-| `logs` | Local source file paths |
-| `counts` | Visible running, starting, idle, approval-waiting, input-waiting and terminal agent counts |
-| `agents` | Agent state, identifiers, timing, source, tools and usage |
-| `sessions` | Session-ID-keyed metadata, status and usage |
-| `errors` | Read/parse warnings; check this before treating a snapshot as complete |
-| `totals` | When known: AIC sum, completeness flag and scope `loaded_sessions`, including hidden sessions |
-| `attention` | Input-waiting session/agent counts across all loaded sessions, including hidden targets |
-
-Waiting sessions/agents include `input_wait.since` (UTC ISO timestamp) and
-`input_wait.wait_seconds`. This metadata does not contain question or answer text.
-
-`counts.done` includes failed and cancelled agents. Inspect each agent's `status`
-when the distinction matters.
-
-Missing self/subagent cost attribution is represented as `null`, not an estimated
-split. Other missing numerical metrics may remain zero; zero is not proof of free
-usage. New optional agent telemetry objects (`configuration`, `completion`,
-`usage`, `tool_stats`, `permissions`, `model_changes`) are omitted when unavailable.
-`usage.aic_final` indicates authoritative shutdown consumption.
-AIC are usage units, not a monetary bill. See
-[accounting details](../README.md#how-it-works).
-
-**Treat snapshots and screenshots as private:** paths, titles, activity,
-identifiers and usage figures can expose work context. Do not commit real
-snapshots, publish them in issues or upload them without reviewing/redacting them.
+| Up/Down, `k`/`j` | Move selection; scroll inside details |
+| Enter | Expand/collapse a group or open details |
+| `q` | Back from details/help, or quit |
+| `/`, Enter, Escape | Edit, apply and clear search |
+| `a` | Cycle activity filter |
+| `d` | Toggle finished entries |
+| `f` | Cycle session focus |
+| `s` | Cycle sort |
+| `t` | Toggle tree/flat |
+| `r` | Refresh and rediscover logs immediately |
+| `?` | Open help |
+| Page Up/Down, Home/End | Navigate long lists or details |

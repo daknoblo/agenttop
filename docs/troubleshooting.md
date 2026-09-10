@@ -1,165 +1,130 @@
 # Troubleshooting
 
-[Back to README](../README.md) | [Installation](installation.md) | [User guide](usage.md)
+[Overview](../README.md) | [Installation](installation.md) | [User guide](usage.md) | [Reference](reference.md)
 
-## Installation cannot find the remote branch
+## Installation stops
 
-Check that the repository URL and `main` branch name match the
-installation instructions. For a private repository, configure authorized Git
-access separately rather than embedding a token in the URL. Use a local checkout
-when remote access is unavailable.
+The Unix one-liner requires `python3` on PATH, an unused launcher path and a
+clone destination that Git can create. The Windows installer requires `git`
+and `py`, and refuses an existing installation directory.
 
-## The installer exits without installing
+If already installed, use `agenttop -update`. An interrupted install can leave
+a checkout without a launcher; inspect the path shown in the error before retrying.
 
-The Unix command requires `python3` on Path and an unused launcher path.
-Git will also refuse a nonempty checkout destination. Windows explicitly refuses
-an existing installation directory.
-
-Check the installation paths in the [installation guide](installation.md).
-An interrupted install can leave a checkout without a launcher. Preserve any
-local work and inspect the directory before deciding to repair or remove it.
-For an existing working installation, use the update instructions instead.
+For GitHub authentication errors, verify access using your normal Git credentials.
 
 ## Command not found
 
-Try the fully qualified launcher:
+Try the full launcher path:
 
-- macOS/Linux/WSL: `~/.local/bin/agenttop`
-- PowerShell: `& "$env:LOCALAPPDATA\agenttop\agenttop.cmd" --once`
+```sh
+"$HOME/.local/bin/agenttop" --version
+```
 
-If that works, add the installation directory to your user Path and open a new
-terminal. The installers intentionally do not edit shell profiles or system Path.
-On Unix, `command -v agenttop` shows which installation a shell resolves.
+```powershell
+& "$env:LOCALAPPDATA\agenttop\agenttop.cmd" --version
+```
+
+If that works, follow the [PATH setup instructions](installation.md).
+On Unix, `command -v agenttop` identifies the selected executable.
 In PowerShell, use `Get-Command agenttop`.
 
-## No sessions, or an expected session is missing
+If Zsh reports `command not found: #` after pasting a command block, omit the
+comment lines. The installation commands in this documentation contain no
+leading shell comments.
 
-1. Confirm that this OS user can read the relevant session/log files.
-2. Remove `--search`, `--session` and source restrictions.
-3. Press `d` or use `--all-done` to include completed entries.
-4. Increase the discovery window with `--max-age 72`.
-5. Use `--log` with the exact file/directory to bypass automatic discovery.
-6. Press `r` to discover recently created files immediately.
+## No sessions or agents appear
 
-Also check the bottom `a activity` control. `active` excludes idle work, and `2h`
-excludes entries whose last recorded event is older than two hours, even if
-their status still says running. Press `a` until it says `all`, or launch with
-`--activity all`. To include recent completed/cancelled work, combine `2h` with
-`d finished:show` (`--activity recent --all-done`).
+1. Cycle `a` to `all` and clear search with Escape.
+2. Cycle `f` back to all sessions.
+3. Press `d` to include finished work.
+4. Try `--max-age 72` for older logs.
+5. Press `r` to rediscover recently created files.
+6. Point `--log` at the exact history or log directory.
 
-The default tree can show sessions without subagents; a flat view cannot.
-Sessions hosted only on github.com are not supported.
-Under WSL, Windows and Linux have separate home directories; point explicitly
-at Windows-side logs when needed.
+The tree can show sessions without subagents; the flat view cannot.
+Chats hosted only on github.com are not a supported source.
+Under WSL, Windows and Linux use separate home directories:
+see [Windows-side logs](installation.md#windows-with-wsl).
 
-## A session is labeled CLI even though it came from VS Code
+## VS Code is shown with a CLI source symbol
 
-Labels identify the input format, not the launching application. CLI histories
-are preferred when the same session also appears in AHP logs to avoid duplicate
-agents and usage. Use `--source vscode` to inspect the AHP-only interpretation.
+The symbol identifies the event format, not the launching application.
+VS Code can write CLI-format histories. For the same session ID, agenttop uses
+that history and supplements it with AHP metadata and UI input requests.
+Use `--source vscode` for an AHP-only view.
 
-## `curses` is missing, or the terminal view does not start
+## Interactive mode fails
 
-Standard native Windows Python does not ship `curses`. Use `--once`/`--json`
-there, or run the TUI inside WSL. On macOS/Linux, check that the selected Python
-distribution provides `curses` and that you are running in an actual terminal.
+Standard native Windows Python has no `curses` module. Use `--once` or `--json`,
+or run the dashboard in WSL.
 
-Use a UTF-8-capable terminal for status symbols and tree drawing. Resize a very
-small terminal; token/AIC columns need at least 132 columns, and models need 160.
-Redirected output is deliberately a snapshot, not an interactive display.
+On macOS/Linux, use a Python distribution with `curses` and an actual terminal.
+Redirecting output intentionally switches to snapshot mode.
 
-## Status, runtime or usage looks wrong
+For clipped fields, widen the window or open the agent's details. Some columns
+are hidden on narrow terminals. Use a UTF-8 terminal/font for the symbols;
+complex emoji widths can vary between terminals.
 
-- Status is reconstructed from logs, not queried from live processes.
-- Idle resumable agents continue to accumulate wall-clock runtime.
-- An application crash or missing final event can leave the last status visible.
-- Old/rotated logs can be missing launch events; `--all-done` reveals orphan entries.
-- AHP-only tool/token details may be absent until VS Code subscribes to the
-  subagent channel, usually after expanding it in the chat UI.
-- CLI token/cost details depend on the events persisted by that CLI version.
-- CLI turn totals depend on available cumulative checkpoints; delayed checkpoints
-  make turn-level attribution approximate.
-- Completion summaries, shutdown usage and observed tool/token data describe
-  different scopes; they are displayed separately and are not added together.
-- The global AIC total includes loaded sessions hidden by display filters.
-  `AIC known` means some session totals are unavailable, not a complete bill.
-- `waiting` agents need approval and are excluded by `--activity active`;
-  use `--activity all` or `recent` to find them.
-- Magenta `input` entries need an answer, not permission approval. The global
-  `INPUT` badge remains visible if filters hide their rows; use `--activity all`.
+## A chat needs an answer but the row is hidden
 
-Blank metrics or unknown attribution are not proof of zero usage.
-Optional missing detail fields are hidden. Scroll the agent detail view with
-Up/Down or Page Up/Down to see known values below the first screen.
-Check `errors` in JSON and any terminal warnings before trusting completeness.
-Changing an interval or source filter cannot recover events that were never logged.
+Check the global `INPUT` badge. It includes filtered-out targets.
+Cycle `a` to `all`: both `active` and `2h` can hide a waiting row.
+Answer in Copilot/VS Code, not agenttop.
 
-### VS Code says "Waiting for answer"
+Use the default combined source mode for the broadest input-event coverage.
+A stale `ask_user` activity label alone does not mean a question remains pending.
+Normal client-tool execution is also not a question.
 
-Use the latest agenttop version and the default combined source mode. VS Code
-input events are processed even when a CLI history supplies the rest of that
-session. Dedicated `ask_user` calls and native SDK input events are also tracked.
+If request or completion records are missing, the monitor can only show the last
+observed state. Verify the originating chat before assuming it is still waiting.
 
-An answer or matching tool completion clears the marker. A plain activity string
-that still says `ask_user` does not keep a completed question pending. Not every
-`session/inputNeededSet` is a user question: normal client-side tool execution
-uses that event too and must not be marked as awaiting an answer.
+## Timing or consumption looks unexpected
 
-With CLI-only logs, old versions can omit transient completion events; missing
-tool/UI completion records can leave the last observed state visible. Check the
-actual chat before assuming it is still waiting. No OS/process or screen scraping
-is used to infer whether an answer is required.
+- Runtime is wall-clock time, not CPU usage. Resumable idle agents keep their
+  original start time.
+- Quiet time measures the last recorded event, not process health.
+- A crash or partial/rotated history can leave an old status visible.
+- AHP subagent tool/usage details may require expanding the agent in VS Code
+  so the host subscribes to its channel.
+- Optional and live-only fields are not guaranteed in every CLI history.
+- `sum N` tokens are a reported aggregate, not current context size.
+- Header AIC includes hidden loaded sessions; `AIC known` indicates incomplete
+  session-total coverage.
 
-## The version is unexpected
+Missing values are not estimates of zero. Open details, scroll through the
+available fields, and check `errors` in a JSON snapshot.
+See [usage accounting](reference.md#usage-accounting) for scope differences.
 
-- `rN.<hash>` identifies your local checkout, not the latest GitHub release.
-- `-dirty` means local modifications or non-ignored untracked files exist.
-- `-shallow` means Git history is incomplete.
-- `unversioned.<fingerprint>` means the program was copied without Git metadata.
-- `unknown (Git unavailable)` means Git could not read the checkout.
+## Update stops
 
-Check which executable your shell resolves and run it with `--version`.
-After updating, restart the monitor. Revision counts can change after branch
-switches or history rewrites; the commit hash is the precise identifier.
+`agenttop -update` and `agenttop --update` must be used alone.
 
-## Self-update stops or the flag is not recognized
+| Message/cause | Next step |
+| --- | --- |
+| Local changes or untracked files | Inspect `git status` and save your work |
+| Not a fast-forward | Review local commits/history; a separate fresh clone may be needed |
+| Different branch or detached HEAD | Switch to `main` manually after saving work |
+| Shallow clone | Fetch complete history or use a full clone |
+| Git operation in progress | Finish or abort that operation manually |
+| No Git metadata | Install a Git checkout; standalone files cannot self-update |
+| Fetch/authentication failure | Check `origin`, network and Git credentials |
+| Timeout | Inspect Git status before retrying |
 
-The top-right update indicator runs a noninteractive check at startup and every
-eight hours. `Update check failed` is not the same as `Up to date`: check network
-access and Git authentication outside the TUI. The next scheduled check retries
-after eight hours. Pressing `r` only reloads logs.
+The updater does not discard local work to resolve these conditions.
+Older versions without this flag need a [manual update](installation.md#updating).
 
-`Local commits ahead` or `History differs` means Git ancestry does not permit the
-normal fast-forward updater. `Restart agenttop` means the installation changed
-while this process was running. A clean full-history main-branch checkout is
-required for normal checks. Use `--no-update-check` to keep monitoring offline.
-Read-only checkouts can also prevent the fetch from updating Git metadata.
+## Update indicator says the check failed
 
-`agenttop -update` and `agenttop --update` are aliases and must be used alone.
-An older version without this feature must first be updated manually; see
-[updating](installation.md#updating).
+The background check is noninteractive and runs at startup, then every eight
+hours. A failure is not the same as "Up to date". Check authentication outside
+the TUI. `r` refreshes logs only.
 
-- **Local changes/untracked files:** inspect `git status` in the installation
-  checkout and preserve your work. The updater never stashes or discards it.
-- **Not a fast-forward:** there are local commits, divergence, or rewritten
-  remote history. Preserve the checkout and install a fresh main-branch clone.
-- **Other branch/detached HEAD:** switch to `main` manually after saving your work.
-- **Shallow history:** fetch complete history manually or use a full clone.
-- **Git operation in progress:** finish or abort that operation manually.
-- **No Git metadata:** standalone copies and source archives cannot self-update.
-- **Fetch error:** verify network access, `origin`, and Git authentication.
-  Private repositories require authorized access.
-- **Timeout:** inspect the checkout before retrying; a fetch or merge may have
-  been interrupted. No automatic rollback or reinstall is attempted.
+Use `--no-update-check` to disable the check. Snapshot and version-only modes
+do not start one. After an update, quit and restart existing monitors.
 
-Ignored files normally do not make a checkout dirty, but an update that would
-overwrite one is rejected. A successful update does not reload another running
-monitor: quit that process and start it again.
+## Report an issue
 
-## Reporting an issue safely
-
-Include OS, Python version, terminal, `agenttop --version`, source mode,
-expected behavior and a minimal synthetic reproduction.
-Do not attach raw Copilot histories, snapshots or screenshots from work sessions
-without reviewing them. They can contain private task text, project paths,
-identifiers and operational details.
+Include your OS, Python version, terminal, `agenttop --version`, command-line
+options, expected behavior and the error message. A small reproducible example
+is more useful than a full session history.
