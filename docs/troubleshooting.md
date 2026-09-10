@@ -41,6 +41,12 @@ In PowerShell, use `Get-Command agenttop`.
 5. Use `--log` with the exact file/directory to bypass automatic discovery.
 6. Press `r` to discover recently created files immediately.
 
+Also check the bottom `a activity` control. `active` excludes idle work, and `2h`
+excludes entries whose last recorded event is older than two hours, even if
+their status still says running. Press `a` until it says `all`, or launch with
+`--activity all`. To include recent completed/cancelled work, combine `2h` with
+`d finished:show` (`--activity recent --all-done`).
+
 The default tree can show sessions without subagents; a flat view cannot.
 Sessions hosted only on github.com are not supported.
 Under WSL, Windows and Linux have separate home directories; point explicitly

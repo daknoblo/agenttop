@@ -548,6 +548,144 @@ class UpdateIndicatorTests(unittest.TestCase):
                 self.assertTrue(tui.call_args.kwargs["check_updates"])
 
 
+class ActivityFilterTests(unittest.TestCase):
+    def setUp(self):
+        self.now = 20000.0
+        self.mon = Monitor()
+        state = self.mon.state_for("session-a", self.now)
+        state["status"] = "running"
+        for name, status, age in (
+            ("running-old", "running", 10800), ("running-recent", "running", 30),
+            ("starting", "starting", 60), ("idle-recent", "idle", 30),
+            ("idle-old", "idle", 10800), ("done-recent", "done", 120),
+            ("cancelled-recent", "cancelled", 90), ("failed-recent", "failed", 180),
+            ("done-old", "done", 10800), ("boundary", "idle", 7200),
+            ("outside", "idle", 7200.01), ("unknown-time", "idle", None),
+        ):
+            agent = Agent(name, "session-a", self.now - 20000)
+            agent.description = name
+            agent.launched = True
+            agent.status = status
+            agent.last_event = self.now - age if age is not None else None
+            if status in ("done", "failed", "cancelled"):
+                agent.ended = agent.last_event
+            self.mon.agents[name] = agent
+
+    def select(self, activity, show_done=False, **kwargs):
+        with patch("time.time", return_value=self.now):
+            return self.mon.select(show_done, "name", activity=activity, **kwargs)
+
+    def names(self, activity, show_done=False, **kwargs):
+        return {a.call_id for a in self.select(activity, show_done, **kwargs)[0]}
+
+    def test_active_means_only_running_and_starting_regardless_of_recency(self):
+        for show_done in (False, True):
+            self.assertEqual(self.names("active", show_done),
+                             {"running-old", "running-recent", "starting"})
+
+    def test_recent_uses_last_event_including_exact_two_hour_boundary(self):
+        self.assertEqual(self.names("recent"),
+                         {"running-recent", "starting", "idle-recent", "boundary"})
+        self.assertEqual(APP["RECENT_ACTIVITY_SECONDS"], 7200)
+
+    def test_finished_toggle_and_recent_filter_compose(self):
+        finished = {"done-recent", "cancelled-recent", "failed-recent"}
+        self.assertTrue(finished.isdisjoint(self.names("recent")))
+        self.assertEqual(self.names("recent", True),
+                         {"running-recent", "starting", "idle-recent", "boundary"} | finished)
+        self.assertNotIn("done-old", self.names("recent", True))
+
+    def test_all_preserves_default_and_hides_all_terminal_states(self):
+        self.assertEqual(self.names("all", True), set(self.mon.agents))
+        terminal = {name for name, a in self.mon.agents.items() if a.ended is not None}
+        self.assertEqual(self.names("all"), set(self.mon.agents) - terminal)
+
+    def test_recent_window_moves_as_time_passes(self):
+        self.assertIn("boundary", self.names("recent"))
+        self.now += 1
+        self.assertNotIn("boundary", self.names("recent"))
+
+    def test_activity_combines_with_search_and_session_focus(self):
+        self.assertEqual(self.names("recent", True, query="cancelled", sess_filter="session-a"),
+                         {"cancelled-recent"})
+        self.assertEqual(self.names("recent", True, query="cancelled", sess_filter="session-b"), set())
+        self.assertEqual(self.names("active", True, query="idle"), set())
+
+    def test_sessions_without_agents_are_filtered_by_their_own_activity(self):
+        for sid, status, age in (("stale", "idle", 10800),
+                                 ("recent", "idle", 60), ("active", "running", 10800)):
+            state = self.mon.state_for(sid, self.now - age)
+            state["status"] = status
+        self.assertEqual(self.select("active")[2], {"session-a", "active"})
+        self.assertEqual(self.select("recent")[2], {"session-a", "recent"})
+
+    def test_matching_child_keeps_finished_or_stale_session_visible(self):
+        state = self.mon.sessions["session-a"]
+        state["status"], state["last_event"] = "done", self.now - 10800
+        self.assertEqual(self.select("active")[2], {"session-a"})
+        self.assertEqual(self.select("recent")[2], {"session-a"})
+
+    def test_json_counts_and_sessions_match_filtered_agents(self):
+        output = io.StringIO()
+        with patch.object(self.mon, "refresh"), patch("time.time", return_value=self.now):
+            with contextlib.redirect_stdout(output):
+                APP["run_once"](self.mon, False, "name", True, activity="recent")
+        payload = json.loads(output.getvalue())
+        self.assertEqual({a["call_id"] for a in payload["agents"]}, self.names("recent"))
+        self.assertEqual(payload["counts"], {"running": 1, "starting": 1, "idle": 2, "done": 0})
+        self.assertEqual(set(payload["sessions"]), {"session-a"})
+
+    def test_text_and_tree_use_same_selection(self):
+        for tree in (True, False):
+            output = io.StringIO()
+            with patch.object(self.mon, "refresh"), patch("time.time", return_value=self.now):
+                with contextlib.redirect_stdout(output):
+                    APP["run_once"](self.mon, False, "name", False, tree=tree, activity="active")
+            self.assertIn("activity:active finished:hide", output.getvalue())
+            self.assertNotIn("idle-recent", output.getvalue())
+            self.assertNotIn("cancelled-recent", output.getvalue())
+            self.assertIn("running-old", output.getvalue())
+
+    def test_cli_defaults_and_explicit_finished_options(self):
+        for args, expected in ((["--json"], True), (["--once"], False),
+                               (["--json", "--hide-done"], False), (["--once", "--all-done"], True)):
+            once = Mock()
+            with patch.dict(APP["main"].__globals__, run_once=once):
+                self.assertEqual(APP["main"]([*args, "--activity", "recent"]), 0)
+            self.assertEqual(once.call_args.args[1], expected)
+            self.assertEqual(once.call_args.kwargs["activity"], "recent")
+
+    def test_invalid_cli_combinations_are_rejected(self):
+        for args in (["--activity", "invalid"], ["--all-done", "--hide-done"]):
+            with contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as exc:
+                    APP["main"](args)
+                self.assertEqual(exc.exception.code, 2)
+
+    def test_footer_shows_current_filter_states(self):
+        self.assertIn("d finished:hide", APP["filter_hint"](False, "all"))
+        self.assertIn("a activity:active", APP["filter_hint"](False, "active"))
+        self.assertIn("d finished:show", APP["filter_hint"](True, "recent"))
+        self.assertIn("a activity:2h", APP["filter_hint"](True, "recent"))
+
+    def test_tui_keyboard_cycles_activity_and_toggles_finished(self):
+        screen = Mock()
+        screen.getmaxyx.return_value = (24, 160)
+        screen.get_wch.side_effect = ["a", "a", "d", "a", "q"]
+        with patch("curses.wrapper", side_effect=lambda callback: callback(screen)), \
+                patch("curses.has_colors", return_value=False), patch("curses.curs_set"), \
+                patch("curses.set_escdelay"), patch.object(self.mon, "refresh"), \
+                patch("time.time", return_value=self.now), \
+                patch.object(self.mon, "select", wraps=self.mon.select) as selected:
+            APP["run_tui"](self.mon, 1, check_updates=False)
+        self.assertEqual([(call.args[0], call.args[4]) for call in selected.call_args_list],
+                         [(False, "all"), (False, "active"), (False, "recent"),
+                          (True, "recent"), (True, "all")])
+        footer = [call.args[2] for call in screen.addnstr.call_args_list if call.args[0] == 23]
+        self.assertTrue(any("d finished:hide  a activity:active" in text for text in footer))
+        self.assertTrue(any("d finished:show  a activity:2h" in text for text in footer))
+
+
 class StartTimeTests(unittest.TestCase):
     def setUp(self):
         self.started = datetime(2026, 9, 10, 9, 24, 7).timestamp()

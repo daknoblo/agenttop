@@ -65,11 +65,47 @@ agenttop --search parser
 agenttop --sort idle
 agenttop --sort start
 agenttop --all-done
+agenttop --activity active
+agenttop --activity recent --all-done
 ```
 
 `aaaaaaaa` is an illustrative ID prefix, not a real session.
 Search is case-insensitive and matches session labels/titles, model names,
 agent descriptions/names, agent type and identifiers.
+
+### Reduce inactive and finished entries
+
+Use the bottom controls to combine two independent filters:
+
+| Control | States | Behavior |
+| --- | --- | --- |
+| `d finished` | `hide` / `show` | Hide or include done, failed and cancelled agents/sessions |
+| `a activity` | `all` / `active` / `2h` | No activity restriction / running and starting only / last recorded event within two hours |
+
+`active` deliberately **excludes idle** agents, including resumable ones.
+It does not require recent events: an agent still marked running remains visible.
+`2h` is based on `last_event`, not delegation time, and can therefore include
+recently idle or completed work. Finished entries still require `d finished:show`.
+The two-hour boundary is inclusive and advances with the clock.
+
+Examples:
+
+```sh
+agenttop --activity active
+agenttop --activity recent
+agenttop --activity recent --all-done
+agenttop --json --activity recent --hide-done
+```
+
+`--activity all` is the default. `--all-done` and `--hide-done` are mutually
+exclusive. TUI/text hide finished entries by default; JSON includes them by
+default unless explicitly hidden or excluded by the activity filter.
+The controls describe current state, not a deletion action.
+
+Session rows without matching children must match the activity filter themselves.
+Sessions with matching agents stay visible even if the session's own status or
+last event would otherwise exclude it. Search and session focus still apply.
+Header counts refer to the filtered agents, not hidden work.
 
 In the TUI:
 
@@ -81,7 +117,8 @@ In the TUI:
 | `/` | Edit the live search text; Enter finishes editing |
 | Escape | Clear search; leave detail/help when open |
 | `f` | Cycle session focus, then return to all sessions |
-| `d` | Include/exclude terminal sessions and agents |
+| `d` | Show/hide done, failed and cancelled sessions and agents |
+| `a` | Cycle all / active (running+starting) / last activity within 2h |
 | `s` | Cycle runtime, start, idle, status and name sorting |
 | `t` | Toggle session tree / flat agent list |
 | `r` | Force an immediate refresh and source discovery |
@@ -146,8 +183,9 @@ every five seconds even if `--interval` is shorter.
 agenttop --json --source cli --session aaaaaaaa > snapshot.json
 ```
 
-JSON includes finished entries automatically. Session/text filters apply to
-the session object, agents array and agent counts. `logs` describes the input
+JSON includes finished entries by default; `--hide-done` excludes them.
+Activity, session and text filters apply to the session object, agents array
+and agent counts. `logs` describes the input
 files independently of the display filter.
 
 Top-level fields:

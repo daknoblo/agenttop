@@ -13,7 +13,7 @@ Illustrative display with entirely synthetic project names, identifiers, tasks
 and usage figures (not a captured session):
 
 ```text
- agenttop r42.0123abcd  12:00:00  running 1  starting 0  idle 1  done 1  | AIU total 12  | sessions 1  logs 1  sort:runtime  tree +done
+ agenttop r42.0123abcd  12:00:00  running 1  starting 0  idle 1  done 1  | AIU total 12  | sessions 1  logs 1  sort:runtime  tree activity:all +finished
 S  STARTED (local)       RUNTIME      QUIET AGENT    TYPE            MOD  TOOLS         TOKENS in/out     AIU TASK
 ▼ >_ example-app@main [aaaaaaaa] running example-model · Update example documentation · 3 agents (2 live, 1 running)
 ●  2026-01-01 11:58      2m 00s         3s 11111111 general-purpose bg   4 · view      12k/1k         1.00 ├─ Update example documentation
@@ -21,7 +21,7 @@ S  STARTED (local)       RUNTIME      QUIET AGENT    TYPE            MOD  TOOLS 
 ✓  2026-01-01 11:59         45s          - 33333333 code-review     sync 3 · view       8k/1k         0.50 └─ Review example tests
 
 aaaaaaaa example-model ctx 16k/128k (8k cached) turn 32k in / 4k out AIU turn 4.00 (self 2.00 + agents 2.00) session 12
- q quit  d done  t tree  s sort  f focus  / search  ? help  enter open  ↑↓ move
+ q quit  d finished:show  a activity:all  t tree  s sort  f focus  / search  ? help
 ```
 
 ## Install
@@ -99,6 +99,9 @@ agenttop --once               # one plain-text snapshot
 agenttop --json               # one snapshot as JSON, for scripts or a status bar
 agenttop --flat               # flat list instead of the per-session tree
 agenttop --all-done           # include finished sessions and agents
+agenttop --hide-done          # exclude done/failed/cancelled (also works with --json)
+agenttop --activity active    # only running or starting, not idle
+agenttop --activity recent    # last recorded activity within two hours
 agenttop --session aaaaaaaa   # restrict to one session (example id prefix)
 agenttop --search parser      # case-insensitive session/task/model search
 agenttop --sort start         # newest delegated agents first
@@ -122,6 +125,35 @@ double-counting agents and consumption. A copied `events.jsonl` retains the sess
 ID recorded in its `session.start` event; the containing folder is only a fallback.
 These compact symbols need no icon font. The help view (`?`) explains them;
 agent details and JSON retain the source names `cli` and `vscode`.
+
+### Activity and finished filters
+
+The bottom controls show the current state of both filters:
+
+- `d finished:hide` / `d finished:show`: press `d` to hide/show terminal entries,
+  including **done, failed and cancelled**.
+- `a activity:all` / `active` / `2h`: press `a` to cycle between no activity
+  restriction, **running/starting only**, and a last recorded event within
+  the previous **two hours**.
+
+These filters combine with each other, search, session focus and source selection.
+The recent filter can include idle or finished agents, but finished agents remain
+hidden unless `d` is set to `show` (or `--all-done` is given). For example:
+
+```sh
+agenttop --activity recent --all-done
+agenttop --json --activity recent --hide-done
+```
+
+Recency is based on the last logged event, not the start time or OS process
+activity. A long-running agent with no recent events is included by `active`
+but can be excluded by `2h`. The cutoff moves while the TUI is open.
+Sessions without matching children are filtered by their own status/activity;
+a matching child keeps its session visible for context.
+
+The default remains `activity:all` with finished entries hidden in TUI/text.
+JSON keeps its existing include-finished default unless `--hide-done` is given.
+No data is deleted by these display filters.
 
 ### Version identification
 
@@ -203,7 +235,8 @@ The `r` key refreshes logs only and does not trigger extra update checks.
 | `Enter` on an agent | detail view: prompt, tool histogram, tokens, AIU |
 | `f` | cycle the session focus filter |
 | `t` | toggle tree / flat |
-| `d` | show or hide finished sessions and agents |
+| `d` | show or hide done, failed and cancelled sessions/agents; footer shows current state |
+| `a` | cycle activity filter: all, running/starting only, last activity within 2h |
 | `s` | cycle sort: runtime, start, idle, status, name |
 | `/` | edit a live text filter; Enter applies, Escape clears |
 | `Esc` | clear the text filter outside detail/help views |
@@ -302,8 +335,9 @@ a fast-forward to the application checkout, without reading session logs.
 
 ### JSON output
 
-`--json` includes finished entries automatically. `--session` and `--search`
-consistently filter the agent array, session object and agent counts. Counts refer
+`--json` includes finished entries by default; use `--hide-done` to exclude them.
+`--activity`, `--session` and `--search` consistently filter the agent array,
+session object and agent counts. Counts refer
 to the visible agents; `done` counts all terminal agents, including failed and
 cancelled ones. Individual `status` fields preserve these distinctions.
 

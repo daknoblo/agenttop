@@ -346,6 +346,8 @@ DESC_DONE_RE = re.compile(r"^`(.+?)`\s+(?:completed|is complete)", re.S)
 # a `task` call that never produced launch args or a result within this window is an orphan
 # (its remaining events were lost to AHP log rotation)
 ORPHAN_AFTER = 120.0
+RECENT_ACTIVITY_SECONDS = 2 * 60 * 60
+ACTIVITY_FILTERS = {"all": "all", "active": "active", "recent": "2h"}
 
 
 def discover_logs(max_age_h: float, patterns=None) -> list[str]:
@@ -1109,14 +1111,26 @@ class Monitor:
         rows.sort(key=keys.get(sort_key, keys["runtime"]))
         return rows, now
 
-    def select(self, show_done, sort_key, sess_filter=None, query=""):
+    def select(self, show_done, sort_key, sess_filter=None, query="", activity="all"):
+        if activity not in ACTIVITY_FILTERS:
+            raise ValueError(f"Unknown activity filter: {activity}")
         rows, now = self.snapshot(show_done, sort_key)
+        def matches(status, last_event):
+            if activity == "active":
+                return status in ("running", "starting")
+            if activity == "recent":
+                return last_event is not None and last_event >= now - RECENT_ACTIVITY_SECONDS
+            return True
+
+        rows = [a for a in rows if matches(a.status, a.last_event)
+                and (activity != "active" or a.ended is None)]
         query = query.casefold()
         agent_sessions = {a.session for a in rows}
         sessions = {
             sid for sid, st in self.sessions.items()
             if (not sess_filter or sid.startswith(sess_filter))
             and (show_done or sid in agent_sessions or st["status"] not in ("done", "failed", "cancelled"))
+            and (sid in agent_sessions or matches(st["status"], st["last_event"]))
         }
         matching = {
             sid for sid in sessions
@@ -1366,8 +1380,12 @@ def header_parts(text, notice, width):
     return clip(text, left_width).ljust(available - len(right)), right
 
 
+def filter_hint(show_done, activity):
+    return f" d finished:{'show' if show_done else 'hide'}  a activity:{ACTIVITY_FILTERS[activity]} "
+
+
 def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done=False,
-            sort_key="runtime", query="", check_updates=True):
+            sort_key="runtime", query="", check_updates=True, activity="all"):
     import curses
 
     checker = UpdateChecker() if check_updates else None
@@ -1397,6 +1415,8 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
 
         show_done = all_done
         current_sort = sort_key
+        current_activity = activity
+        activity_cycle = tuple(ACTIVITY_FILTERS)
         sort_cycle = ["runtime", "start", "idle", "status", "name"]
         tree_mode = tree
         collapsed = set()
@@ -1416,7 +1436,7 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                 mon.refresh()
                 last_poll = time.time()
 
-            rows, now, sessions = mon.select(show_done, current_sort, session_focus, search)
+            rows, now, sessions = mon.select(show_done, current_sort, session_focus, search, current_activity)
             height, width = stdscr.getmaxyx()
             stdscr.erase()
 
@@ -1428,7 +1448,8 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                        f" | AIU total {fmt_aiu(aiu_total)}"
                        f"{f' (live agents {fmt_aiu(aiu_live)})' if aiu_live else ''}"
                        f"  | sessions {len(sessions)}  logs {len(mon.files)}  sort:{current_sort}"
-                       f"{'  tree' if tree_mode else '  flat'}{'  +done' if show_done else ''}"
+                       f"{'  tree' if tree_mode else '  flat'}  activity:{ACTIVITY_FILTERS[current_activity]}"
+                       f"{'  +finished' if show_done else ''}"
                        f"{'  filter:' + session_focus[:8] if session_focus else ''} ")
             try:
                 left, right = header_parts(title + summary, notice.text, width)
@@ -1445,7 +1466,9 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                 help_lines = [
                     "agenttop - local Copilot session and agent monitor",
                     "Up/Down, j/k: move    Enter: expand session / agent details",
-                    "d: include finished    t: tree/flat    s: cycle sort",
+                    "d: show/hide done, failed and cancelled    t: tree/flat    s: sort",
+                    "a: cycle activity - all / active (running+starting only) / last 2h",
+                    "The 2h filter uses the last recorded event; d still controls finished entries.",
                     "f: cycle session focus    /: search    Esc: clear search",
                     "r: rescan logs now    ?: help    q: back / quit",
                     f"Sources: {SOURCE_GLYPH['cli']} CLI history, {SOURCE_GLYPH['vscode']} VS Code AHP",
@@ -1495,7 +1518,7 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                 if not body:
                     try:
                         message = ("  no logs found - use --log PATH or --cli-dir PATH"
-                                   if not mon.files else "  no matching entries - d: finished, Esc: clear search, f: focus")
+                                   if not mon.files else "  no matching entries - a: activity, d: finished, Esc: search, f: focus")
                         stdscr.addnstr(top, 0, message,
                                        width - 1, curses.A_DIM)
                     except curses.error:
@@ -1506,10 +1529,15 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                     except curses.error:
                         pass
 
-            hint = (" q quit  d done  t tree  s sort  f focus  / search  ? help  enter open  \u2191\u2193 move "
-                    if detail is None else " q/esc/left  back ")
-            if search or editing_search:
-                hint = f" / {search}  [Enter: apply, Esc: clear] " if editing_search else f" search:{search}  / edit  Esc clear "
+            filters = filter_hint(show_done, current_activity)
+            if detail is not None or show_help:
+                hint = " q/esc  back "
+            elif editing_search:
+                hint = f" / {search}  [Enter: apply, Esc: clear] "
+            elif search:
+                hint = f" q quit {filters} search:{search}  / edit  Esc clear "
+            else:
+                hint = f" q quit {filters} t tree  s sort  f focus  / search  ? help  enter open  \u2191\u2193 move "
             try:
                 stdscr.addnstr(height - 1, 0, (hint + STATUS_LEGEND).ljust(width), width,
                                curses.color_pair(6) if use_color else curses.A_REVERSE)
@@ -1545,6 +1573,10 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                 return
             if ch in (ord("d"), ord("D")):
                 show_done = not show_done
+                cursor = 0
+            elif ch in (ord("a"), ord("A")):
+                current_activity = activity_cycle[(activity_cycle.index(current_activity) + 1) % len(activity_cycle)]
+                cursor = 0
             elif ch in (ord("s"), ord("S")):
                 current_sort = sort_cycle[(sort_cycle.index(current_sort) + 1) % len(sort_cycle)]
             elif ch in (ord("r"), ord("R")):
@@ -1696,9 +1728,10 @@ def render_detail(stdscr, agent, height, width):
             row += 1
 
 
-def run_once(mon: Monitor, show_done: bool, sort_key: str, as_json: bool, tree=True, sess_filter=None, query=""):
+def run_once(mon: Monitor, show_done: bool, sort_key: str, as_json: bool, tree=True, sess_filter=None, query="",
+             activity="all"):
     mon.refresh()
-    rows, now, sessions = mon.select(show_done, sort_key, sess_filter, query)
+    rows, now, sessions = mon.select(show_done, sort_key, sess_filter, query, activity)
     if as_json:
         payload = {
             "version": version(),
@@ -1753,7 +1786,8 @@ def run_once(mon: Monitor, show_done: bool, sort_key: str, as_json: bool, tree=T
     width = min(200, shutil.get_terminal_size((120, 24)).columns)
     running, starting, idle, done = mon.counts(rows)
     print(f"agenttop {version()}  running {running}  starting {starting}  idle {idle}  done {done}"
-          f"  | sessions {len(sessions)}  logs {len(mon.files)}")
+          f"  | sessions {len(sessions)}  logs {len(mon.files)}"
+          f"  | activity:{ACTIVITY_FILTERS[activity]} finished:{'show' if show_done else 'hide'}")
     header, body = build_display(mon, rows, now, width, tree, set(), sessions)
     print(header)
     for _kind, _obj, _status, text in body:
@@ -1786,7 +1820,14 @@ def main(argv=None):
     ap.add_argument("--interval", type=positive_float, default=1.0, help="poll interval in seconds (default 1.0)")
     ap.add_argument("--max-age", type=positive_float, default=24.0,
                     help="only auto-discover logs modified within N hours (default 24)")
-    ap.add_argument("--all-done", action="store_true", help="also list finished agents")
+    finished = ap.add_mutually_exclusive_group()
+    finished.add_argument("--all-done", dest="show_done", action="store_true",
+                          help="include done, failed and cancelled agents/sessions (default for JSON)")
+    finished.add_argument("--hide-done", dest="show_done", action="store_false",
+                          help="hide finished agents/sessions, including in JSON (default for TUI/text)")
+    ap.set_defaults(show_done=None)
+    ap.add_argument("--activity", choices=tuple(ACTIVITY_FILTERS), default="all",
+                    help="all: no activity restriction; active: running/starting; recent: last event within 2h")
     ap.add_argument("--sort", default="runtime", choices=["runtime", "start", "idle", "status", "name"])
     ap.add_argument("--flat", action="store_true", help="flat list instead of the session tree")
     ap.add_argument("--session", metavar="ID", help="only show this session (id prefix)")
@@ -1800,14 +1841,15 @@ def main(argv=None):
         return update_checkout()
 
     mon = Monitor(targets=args.log, max_age_h=args.max_age, source=args.source, cli_dir=args.cli_dir)
+    show_done = args.json if args.show_done is None else args.show_done
     if args.once or args.json or not sys.stdout.isatty():
-        run_once(mon, args.all_done or args.json, args.sort, args.json,
-                 tree=not args.flat, sess_filter=args.session, query=args.search)
+        run_once(mon, show_done, args.sort, args.json,
+                 tree=not args.flat, sess_filter=args.session, query=args.search, activity=args.activity)
         return 0
     try:
         run_tui(mon, args.interval, tree=not args.flat, sess_filter=args.session,
-                all_done=args.all_done, sort_key=args.sort, query=args.search,
-                check_updates=not args.no_update_check)
+                all_done=show_done, sort_key=args.sort, query=args.search,
+                check_updates=not args.no_update_check, activity=args.activity)
     except KeyboardInterrupt:
         pass
     return 0
