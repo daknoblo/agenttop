@@ -14,11 +14,11 @@ and usage figures (not a captured session):
 
 ```text
  agenttop r42.0123abcd | AIC total 12  12:00:00  running 1  starting 0  idle 1  done 1  waiting 0 | sessions 1  logs 1  sort:runtime  tree activity:all +finished
-S  STARTED (local)       RUNTIME      QUIET AGENT    TYPE            MOD  MODEL            TOOLS         TOKENS           AIC TASK
-▼ >_ example-app@main [aaaaaaaa] running example-model · Update example documentation · 3 agents (2 live, 1 running)
-●  2026-01-01 11:58      2m 00s         3s 11111111 general-purpose bg   example-model    4 · view      12k/1k         1.00 ├─ Update example documentation
-◌  2026-01-01 11:58      1m 30s        30s 22222222 explore         bg   example-model    2 · glob       6k/1k         0.50 ├─ Find example files
-✓  2026-01-01 11:59         45s          - 33333333 code-review     sync example-model    3 · view       sum 9k        0.50 └─ Review example tests
+S  │ STARTED (local)  │    RUNTIME │     QUIET │ AGENT    │ TYPE               │ EXEC       │ MODEL                        │ TOOLS                │         TOKENS │        AIC │ TASK
+▼ >_ example-app@main                     [aaaaaaaa]  running    model: example-model                    2/3 agents     12.00 AIC      0 tools     turn 2m 00s  Update example documentation
+●  │ 2026-01-01 11:58 │     2m 00s │        3s │ 11111111 │ general-purpose    │ background │ example-model                │ 3 · view             │         12k/1k │       1.00 │ ├─ Update example documentation
+◌  │ 2026-01-01 11:58 │     1m 30s │        3s │ 22222222 │ explore            │ background │                              │ 3 · glob             │                │     0.5000 │ ├─ Find example files
+✓  │ 2026-01-01 11:59 │        45s │         - │ 33333333 │ code-review        │ sync       │ example-model                │ 3 · view             │         sum 9k │     0.5000 │ └─ Review example tests
 
 aaaaaaaa example-model ctx 16k/128k (8k cached) turn 32k in / 4k out AIC turn 4.00 (self 2.00 + agents 2.00) AIC session 12
  q quit  d finished:show  a activity:all  t tree  s sort  f focus  / search  ? help
@@ -252,7 +252,10 @@ The `r` key refreshes logs only and does not trigger extra update checks.
 Session group headers use aligned fields rather than variable-length highlighted
 text. Unselected groups are cyan and underlined across the row; only the selected
 session or agent gets the full-width selection background. Agent columns have
-two-cell gaps, clipped field widths and right-aligned numeric values.
+visible vertical separators, clipped field widths and right-aligned numeric values.
+Empty cells retain their separators, so values in adjacent rows remain clearly
+assigned to their columns. At 200 columns and wider, model names get 28 cells,
+tool summaries 20 cells and execution mode 10 cells.
 Input-waiting groups/agents are highlighted in magenta, including a distinct
 selection color; approval-waiting groups use yellow instead of cyan.
 
@@ -268,7 +271,7 @@ Session counts use `live/total agents` for the currently displayed group.
 | `QUIET` | time since the last event for this agent — how long you have been waiting |
 | `AGENT` | short `agent_id` (background) or tool call id (sync) |
 | `TYPE` | agent type: `general-purpose`, `code-review`, `research`, `explore`, … |
-| `MOD` | `bg` for background agents, `sync` for blocking delegations |
+| `EXEC` | execution mode: `background` (`bg` on compact layouts) or `sync` for blocking delegations; formerly labeled `MOD` |
 | `MODEL` | current recorded model (shown from 160 columns) |
 | `TOOLS` | reported completion tool count when available, otherwise observed calls; most frequently observed tool |
 | `TOKENS` | `sum N` for reported total input+output usage, otherwise observed context / output; shown from 132 columns |

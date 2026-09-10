@@ -1747,14 +1747,23 @@ def pad_line(text, width):
 COLS = {"status": 2, "started": 16, "rt": 9, "quiet": 8, "id": 8, "type": 15, "mode": 4, "tools": 13, "model": 16,
         "tok": 12, "aiu": 7}
 COLUMN_LABELS = {"status": "S", "started": "STARTED (local)", "rt": "RUNTIME", "quiet": "QUIET",
-                 "id": "AGENT", "type": "TYPE", "mode": "MOD", "model": "MODEL", "tools": "TOOLS",
+                 "id": "AGENT", "type": "TYPE", "mode": "EXEC", "model": "MODEL", "tools": "TOOLS",
                  "tok": "TOKENS", "aiu": "AIC"}
 RIGHT_ALIGNED = {"rt", "quiet", "tok", "aiu"}
+COLUMN_SEPARATOR = " \u2502 "
 WIDE_AT = 132                                       # show TOKENS/AIC columns from here
 MODEL_AT = 160
 
 
+def column_widths(width):
+    widths = dict(COLS)
+    if width >= 200:
+        widths.update(rt=10, quiet=9, type=18, mode=10, model=28, tools=20, tok=14, aiu=10)
+    return widths
+
+
 def table_columns(width):
+    widths = column_widths(width)
     columns = ["status", "started", "rt", "quiet", "id", "type", "mode"]
     if width >= MODEL_AT:
         columns.append("model")
@@ -1762,7 +1771,7 @@ def table_columns(width):
     if width >= WIDE_AT:
         columns.extend(("tok", "aiu"))
     for optional in ("tools", "mode", "quiet", "type", "id", "rt", "started"):
-        if sum(COLS[key] + 2 for key in columns) <= max(0, width - 1 - 16):
+        if sum(widths[key] + len(COLUMN_SEPARATOR) for key in columns) <= max(0, width - 1 - 16):
             break
         if optional in columns:
             columns.remove(optional)
@@ -1770,8 +1779,9 @@ def table_columns(width):
 
 
 def format_columns(values, width):
-    return "  ".join(fit_cell(values.get(key, ""), COLS[key], key in RIGHT_ALIGNED)
-                     for key in table_columns(width)) + "  "
+    widths = column_widths(width)
+    return COLUMN_SEPARATOR.join(fit_cell(values.get(key, ""), widths[key], key in RIGHT_ALIGNED)
+                                 for key in table_columns(width)) + COLUMN_SEPARATOR
 
 
 def table_header(width):
@@ -1781,7 +1791,7 @@ def table_header(width):
 def agent_line(a, now, width, prefix=""):
     status = a.display_status
     quiet = fmt_dur(now - (a.last_event or now)) if a.ended is None else "-"
-    mode = "bg" if a.mode == "background" else "sync"
+    mode = ("background" if column_widths(width)["mode"] >= 10 else "bg") if a.mode == "background" else "sync"
     if a.total_tokens is not None:
         tok = f"sum {fmt_tokens(a.total_tokens) if a.total_tokens else '0'}"
     else:
@@ -1824,7 +1834,8 @@ def session_header(mon: Monitor, sid, kids, now, collapsed, width):
         status = session_status(st) if st else "unknown"
         parts.append(fit_cell("INPUT" if status == "input" else status, 9))
     if width >= 132:
-        parts.append(fit_cell(st.get("model") or "", 16))
+        model = f"model: {st['model']}" if st.get("model") else ""
+        parts.append(fit_cell(model, 34 if width >= 200 else 24))
     if width >= 100:
         parts.append(fit_cell(f"{len(live)}/{len(kids)} agents", 14, right=True))
     if width >= 120:
@@ -2054,6 +2065,7 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                     f"Sources: {SOURCE_GLYPH['cli']} CLI history, {SOURCE_GLYPH['vscode']} VS Code AHP",
                     "Idle background agents can be resumed with write_agent.",
                     "STARTED is local date/time; agent details show seconds and UTC offset.",
+                    "EXEC: background (bg) or blocking sync. MODEL: the language model used.",
                     "Approval waits are excluded by 'active'; use 'all' or '2h' to see them.",
                     "Magenta INPUT / keyboard symbol: answer needed in Copilot/VS Code.",
                     "The INPUT badge includes hidden loaded sessions/agents; 'active' excludes input waits.",

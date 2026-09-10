@@ -47,6 +47,9 @@ Unselected session headers use a subtle cyan underline instead of bright bars
 of different lengths. The selected row has the same full-width highlight whether
 it is a session or an agent. In monochrome terminals, selection uses reverse video.
 Numeric columns are right-aligned and separated from neighboring fields.
+Vertical separators remain present when values are missing, preventing numbers
+or model names in neighboring rows from appearing to belong to another column.
+Terminals at least 200 columns wide use wider model, tool, type and usage fields.
 Magenta highlights a session or agent that needs an answer. An affected group
 also highlights when a displayed child is waiting, even while collapsed.
 The keyboard symbol (U+2328) and `INPUT` text make this recognizable without color.
@@ -55,6 +58,13 @@ As the terminal narrows, lower-priority columns disappear to preserve room for
 the task description. Widen the terminal or open details to see hidden values.
 Clipping and padding account for common wide characters and combining accents;
 complex emoji rendering can still vary with the terminal and font.
+
+`EXEC` (formerly `MOD`) is the execution mode: `background` or, in compact
+layouts, `bg` means the caller can continue while the agent runs; `sync` means
+the caller waits for its result. `MODEL` is the language model used by that
+agent. These are independent properties. Session summaries explicitly prefix
+their model with `model:` to distinguish them from the execution-mode column.
+The JSON `mode` and `model` fields are unchanged.
 
 When the header says `Update: agenttop -update`, quit with `q`, run
 `agenttop -update`, then start the monitor again. `Up to date` refers to the

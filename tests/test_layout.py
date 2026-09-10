@@ -45,12 +45,14 @@ class TableLayoutTests(unittest.TestCase):
                 header = APP["table_header"](width)
                 _, row = APP["agent_line"](agent, self.now, width)
                 offset = 0
+                widths = APP["column_widths"](width)
+                separator = APP["COLUMN_SEPARATOR"]
                 for key in APP["table_columns"](width):
-                    cell = APP["COLS"][key]
-                    self.assertEqual(row[offset + cell:offset + cell + 2], "  ")
+                    cell = widths[key]
+                    self.assertEqual(row[offset + cell:offset + cell + len(separator)], separator)
                     if key in APP["RIGHT_ALIGNED"]:
                         self.assertNotEqual(row[offset + cell - 1], " ")
-                    offset += cell + 2
+                    offset += cell + len(separator)
                 self.assertEqual(header.index("TASK"), offset)
                 self.assertEqual(row.index("TASK-MARKER"), offset)
                 self.assertLessEqual(len(row), width - 1)
@@ -63,6 +65,45 @@ class TableLayoutTests(unittest.TestCase):
         self.assertNotIn("tools", APP["table_columns"](80))
         self.assertIn("model", APP["table_columns"](160))
         self.assertIn("tok", APP["table_columns"](132))
+
+    def test_wide_tables_expand_fields_and_clarify_execution_mode(self):
+        self.assertGreater(APP["column_widths"](240)["model"], APP["column_widths"](160)["model"])
+        self.assertGreater(APP["column_widths"](240)["tools"], APP["column_widths"](160)["tools"])
+        agent = self.agents[0]
+        agent.mode = "background"
+        agent.model = "claude-sonnet-example-model"
+        header = APP["table_header"](240)
+        row = APP["agent_line"](agent, self.now, 240)[1]
+        self.assertIn("EXEC", header)
+        self.assertNotIn("MOD ", header)
+        self.assertIn("background", row)
+        self.assertIn(agent.model, row)
+        self.assertEqual(agent.mode, "background")
+        agent.mode = "sync"
+        self.assertIn("sync", APP["agent_line"](agent, self.now, 240)[1])
+
+    def test_empty_fields_keep_visible_boundaries_between_alternating_rows(self):
+        first, second = self.agents
+        first.model = "example-model"
+        first.tokens_known = True
+        first.in_tokens, first.out_tokens = 10, 2
+        second.model = ""
+        second.tools["view"] = 10
+        second.aiu, second.aiu_known = 4.5, True
+        rows = [APP["agent_line"](agent, self.now, 240)[1] for agent in (first, second)]
+        boundaries = [[i for i, char in enumerate(row) if char == "\u2502"] for row in rows]
+        self.assertEqual(boundaries[0], boundaries[1])
+        self.assertEqual(boundaries[0], [i for i, char in enumerate(APP["table_header"](240)) if char == "\u2502"])
+        keys = APP["table_columns"](240)
+        model_index = keys.index("model")
+        cells = rows[1].split(APP["COLUMN_SEPARATOR"])
+        self.assertEqual(cells[model_index], " " * APP["column_widths"](240)["model"])
+        self.assertIn("10", cells[keys.index("tools")])
+        self.assertEqual(cells[keys.index("tok")].strip(), "")
+        self.assertEqual(cells[keys.index("aiu")].strip(), "4.50")
+        first_cells = rows[0].split(APP["COLUMN_SEPARATOR"])
+        self.assertEqual(first_cells[keys.index("tok")].strip(), "10/2")
+        self.assertEqual(first_cells[keys.index("aiu")].strip(), "")
 
     def test_wide_and_combining_text_keeps_task_column_aligned(self):
         agent = self.agents[0]
