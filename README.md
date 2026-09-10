@@ -120,7 +120,8 @@ five seconds; `r` forces an immediate rescan.
 The `>_` (CLI) / `◇` (VS Code) symbol identifies the **data source**, not necessarily the
 application that launched the chat. VS Code can also write Copilot CLI session
 histories. When both sources cover the same session, the CLI history supplies
-the lifecycle and usage, while AHP supplies repository/branch metadata. This avoids
+the lifecycle and usage, while AHP supplies repository/branch metadata and input
+requests from the VS Code UI. This avoids
 double-counting agents and consumption. A copied `events.jsonl` retains the session
 ID recorded in its `session.start` event; the containing folder is only a fallback.
 These compact symbols need no icon font. The help view (`?`) explains them;
@@ -252,6 +253,8 @@ Session group headers use aligned fields rather than variable-length highlighted
 text. Unselected groups are cyan and underlined across the row; only the selected
 session or agent gets the full-width selection background. Agent columns have
 two-cell gaps, clipped field widths and right-aligned numeric values.
+Input-waiting groups/agents are highlighted in magenta, including a distinct
+selection color; approval-waiting groups use yellow instead of cyan.
 
 On narrow terminals, lower-priority columns are hidden to keep task descriptions
 visible. Widen the terminal or open agent details to see omitted fields.
@@ -259,7 +262,7 @@ Session counts use `live/total agents` for the currently displayed group.
 
 | Column | Meaning |
 | --- | --- |
-| `S` | status: `⏸` awaiting approval, `●` running, `○` starting, `◌` idle, `✓` done, `✗` failed, `⊘` cancelled, `?` unknown |
+| `S` | status: `⌨` awaiting an answer, `⏸` awaiting approval, `●` running, `○` starting, `◌` idle, `✓` done, `✗` failed, `⊘` cancelled, `?` unknown |
 | `STARTED (local)` | first observed delegation/start time as `YYYY-MM-DD HH:MM` in your local timezone; details include seconds and UTC offset |
 | `RUNTIME` | wall clock since the agent was delegated |
 | `QUIET` | time since the last event for this agent — how long you have been waiting |
@@ -283,6 +286,17 @@ JSON `started_at` remains an ISO-8601 UTC timestamp; unknown timestamps remain
 Enter opens a scrollable detail view. Missing optional values are omitted,
 not filled with estimates; explicitly reported zero values remain visible.
 
+- **Waiting for an answer:** `input` status, a keyboard symbol and magenta rows
+  distinguish user questions from permission approvals. CLI `ask_user` calls,
+  SDK `user_input.*` events and VS Code `chat/inputRequested` /
+  `session/inputNeededSet(kind: chatInput)` signals are correlated with their
+  completions. Ordinary client-tool execution does not imply a question.
+  These AHP input signals are retained even for CLI-backed sessions.
+  The top `INPUT N` badge counts loaded sessions/agents needing an answer,
+  including those hidden by filters; choose `a activity:all` to reveal them.
+  A collapsed group is also highlighted when a visible child needs an answer.
+  Reply in Copilot/VS Code, not in agenttop. Question and answer text is not
+  copied into the added input metadata.
 - **Approval waits:** CLI `permission.requested` / `permission.completed` events
   produce `waiting` status, permission kind, pending wait time and resolution
   counts. Requests already resolved by hooks do not appear as user waits.
@@ -396,6 +410,11 @@ session object and agent counts. Counts refer
 to the visible agents; `done` counts all terminal agents, including failed and
 cancelled ones. Individual `status` fields preserve these distinctions.
 `counts.waiting` counts visible agents with outstanding approval requests.
+`counts.input` counts visible agents awaiting an answer. Sessions and agents
+also expose an optional `input_wait` with a UTC `since` timestamp and elapsed
+seconds. Top-level `attention` reports `input_sessions` and `input_agents` across
+all loaded sessions, independent of display filters. These count waiting targets,
+not individual questions or duplicated UI notifications.
 
 Optional per-agent `configuration`, `model_changes`, `completion`, `usage`,
 `tool_stats`, `permissions` and `last_error` fields expose the added telemetry.

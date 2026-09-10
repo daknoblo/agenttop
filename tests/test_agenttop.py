@@ -632,7 +632,7 @@ class ActivityFilterTests(unittest.TestCase):
                 APP["run_once"](self.mon, False, "name", True, activity="recent")
         payload = json.loads(output.getvalue())
         self.assertEqual({a["call_id"] for a in payload["agents"]}, self.names("recent"))
-        self.assertEqual(payload["counts"], {"running": 1, "starting": 1, "idle": 2, "done": 0, "waiting": 0})
+        self.assertEqual(payload["counts"], {"running": 1, "starting": 1, "idle": 2, "done": 0, "waiting": 0, "input": 0})
         self.assertEqual(set(payload["sessions"]), {"session-a"})
 
     def test_text_and_tree_use_same_selection(self):

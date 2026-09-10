@@ -85,12 +85,30 @@ Redirected output is deliberately a snapshot, not an interactive display.
   `AIC known` means some session totals are unavailable, not a complete bill.
 - `waiting` agents need approval and are excluded by `--activity active`;
   use `--activity all` or `recent` to find them.
+- Magenta `input` entries need an answer, not permission approval. The global
+  `INPUT` badge remains visible if filters hide their rows; use `--activity all`.
 
 Blank metrics or unknown attribution are not proof of zero usage.
 Optional missing detail fields are hidden. Scroll the agent detail view with
 Up/Down or Page Up/Down to see known values below the first screen.
 Check `errors` in JSON and any terminal warnings before trusting completeness.
 Changing an interval or source filter cannot recover events that were never logged.
+
+### VS Code says "Waiting for answer"
+
+Use the latest agenttop version and the default combined source mode. VS Code
+input events are processed even when a CLI history supplies the rest of that
+session. Dedicated `ask_user` calls and native SDK input events are also tracked.
+
+An answer or matching tool completion clears the marker. A plain activity string
+that still says `ask_user` does not keep a completed question pending. Not every
+`session/inputNeededSet` is a user question: normal client-side tool execution
+uses that event too and must not be marked as awaiting an answer.
+
+With CLI-only logs, old versions can omit transient completion events; missing
+tool/UI completion records can leave the last observed state visible. Check the
+actual chat before assuming it is still waiting. No OS/process or screen scraping
+is used to infer whether an answer is required.
 
 ## The version is unexpected
 

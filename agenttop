@@ -331,6 +331,7 @@ KEEP_TOKENS = (
     "metaChanged",
     "sessionSummaryChanged",
     "chatAdded",
+    "inputNeededSet", "inputNeededRemoved", "inputRequested", "inputCompleted",
 )
 CLI_EVENTS = (
     "session.start", "session.resume", "session.shutdown", "session.model_change",
@@ -340,7 +341,10 @@ CLI_EVENTS = (
     "subagent.completed", "subagent.failed", "system.notification", "abort",
     "model.model_call_success",
     "subagent.configured", "permission.requested", "permission.completed",
+    "user_input.requested", "user_input.completed",
 )
+AHP_INPUT_EVENTS = {"chat/inputRequested", "chat/inputCompleted",
+                    "session/inputNeededSet", "session/inputNeededRemoved"}
 
 AGENT_ID_RE = re.compile(r"agent_id:?\s*`?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
 BG_DONE_RE = re.compile(r"[Bb]ackground agent ([0-9a-f-]{36}) is (?:completed|complete|done)")
@@ -419,6 +423,8 @@ def is_metric(value):
 
 
 def session_status(state):
+    if state.get("inputs") and state["status"] not in ("done", "failed", "cancelled"):
+        return "input"
     if state.get("permissions") and state["status"] not in ("done", "failed", "cancelled"):
         return "waiting"
     return state["status"]
@@ -435,7 +441,7 @@ class Agent:
         "configuration", "model_changes", "completion", "usage_totals", "final_aiu", "aiu_known",
         "pending_tools", "completed_tools", "tool_results", "tool_durations", "tool_samples",
         "recent_results", "last_error", "permissions", "permission_results", "permission_wait", "tool_max",
-        "last_permission", "tokens_known", "native_terminal",
+        "last_permission", "tokens_known", "native_terminal", "inputs",
     )
 
     def __init__(self, call_id, session, started, parent=None):
@@ -487,9 +493,12 @@ class Agent:
         self.permission_wait = 0.0
         self.last_permission = ""
         self.native_terminal = False
+        self.inputs = {}
 
     @property
     def display_status(self):
+        if self.inputs and self.ended is None:
+            return "input"
         return "waiting" if self.permissions and self.ended is None else self.status
 
     @property
@@ -637,6 +646,7 @@ class Agent:
             self.status = status
         self.native_terminal = native
         self.permissions.clear()
+        self.inputs.clear()
         self.pending_tools.clear()
 
     def refresh_status(self, now: float):
@@ -660,6 +670,8 @@ class Monitor:
         self.tool_owners = {}
         self.pending_permissions = {}
         self.pending_configuration = {}
+        self.input_requests = {}
+        self.input_aliases = {}
         self.sessions: dict[str, dict] = {}
         self.files: list[str] = []
         self.errors: list[str] = []
@@ -760,8 +772,113 @@ class Monitor:
         previous = self.sessions.pop(sid, None)
         if previous:
             state = self.state_for(sid, previous["last_event"])
-            for key in ("repo", "branch"):
+            for key in ("repo", "branch", "inputs"):
                 state[key] = previous[key]
+
+    def start_input(self, sess, key, owner, ts, origin, tool_call=None):
+        state = self.state_for(sess, ts)
+        if (owner is not None and owner.ended is not None) or (
+                owner is None and state["status"] in ("done", "failed", "cancelled")):
+            return
+        if (sess, key) in self.input_requests:
+            previous, _ = self.input_requests[(sess, key)]
+            if key in (previous.inputs if previous else state["inputs"]):
+                return
+            self.complete_input(sess, key)
+        info = {"started": ts, "origin": origin}
+        if tool_call:
+            info["tool_call_id"] = tool_call
+        self.input_requests[(sess, key)] = (owner, info)
+        (owner.inputs if owner else state["inputs"])[key] = info
+        state["last_event"] = max(state["last_event"], ts)
+        if owner:
+            owner.last_event = ts
+
+    def complete_input(self, sess, key, ts=None):
+        primary = self.input_aliases.pop((sess, key), key)
+        if key.startswith("cli:") and any(
+                sid == sess and alias.startswith("cli:") and target == primary
+                for (sid, alias), target in self.input_aliases.items()):
+            return
+        pending = self.input_requests.pop((sess, primary), None)
+        if pending:
+            owner, _ = pending
+            (owner.inputs if owner else self.sessions[sess]["inputs"]).pop(primary, None)
+            if ts is not None:
+                self.sessions[sess]["last_event"] = max(self.sessions[sess]["last_event"], ts)
+                if owner:
+                    owner.last_event = ts
+        self.input_aliases = {alias: target for alias, target in self.input_aliases.items()
+                              if alias[0] != sess or target != primary}
+
+    def complete_input_tool(self, sess, call):
+        for (sid, key), (_, info) in list(self.input_requests.items()):
+            if sid == sess and info.get("tool_call_id") == call:
+                self.complete_input(sess, key)
+
+    def clear_inputs(self, sess, owner=None, all_owners=False, before=None):
+        for (sid, key), (target, info) in list(self.input_requests.items()):
+            if (sid == sess and (all_owners or target is owner)
+                    and (before is None or info["started"] <= before)):
+                self.complete_input(sess, key)
+
+    def input_tool_started(self, sess, tool, call, ts, owner=None):
+        if isinstance(tool, str) and tool.rsplit(".", 1)[-1] == "ask_user" and call:
+            self.start_input(sess, f"tool:{call}", owner, ts, "ask_user", call)
+
+    def adopt_inputs(self, agent):
+        for (sess, key), (previous, info) in list(self.input_requests.items()):
+            if (sess == agent.session and previous is not None and previous is not agent
+                    and previous.call_id.rsplit("/", 1)[-1] == agent.call_id.rsplit("/", 1)[-1]
+                    and key in previous.inputs):
+                previous.inputs.pop(key)
+                agent.inputs[key] = info
+                self.input_requests[(sess, key)] = (agent, info)
+
+    def agent_for_chat(self, chat, sess=None):
+        raw_call = chat.rsplit("/", 1)[-1]
+        candidates = [a for a in self.agents.values()
+                      if a.call_id.rsplit("/", 1)[-1] == raw_call and (sess is None or a.session == sess)]
+        return candidates[0] if len(candidates) == 1 else None
+
+    def on_ahp_input(self, sess, kind, action, ts, owner=None):
+        if kind in ("chat/inputCompleted", "session/inputNeededRemoved"):
+            request_id = action.get("requestId") if kind == "chat/inputCompleted" else action.get("id")
+            if isinstance(request_id, str):
+                self.complete_input(sess, f"ahp:{request_id}", ts)
+            return
+        request = action.get("request") or {}
+        outer_id = request.get("id")
+        chat = request.get("chat") or ""
+        if chat.startswith("ahp-chat://subagent"):
+            owner = self.agent_for_chat(chat, sess)
+            if owner is None:
+                self.report_error(f"Input request for an unmapped subagent in {sess[:8]}")
+                return
+        if kind == "session/inputNeededSet":
+            if request.get("kind") == "toolClientExecution":
+                tool = request.get("toolCall") or {}
+                call = tool.get("toolCallId")
+                if call:
+                    normalized = f"{sess}/{call}"
+                    self.input_tool_started(sess, tool.get("toolName"), normalized, ts, owner)
+                    if (sess, f"tool:{normalized}") in self.input_requests and isinstance(outer_id, str):
+                        self.input_aliases[(sess, f"ahp:{outer_id}")] = f"tool:{normalized}"
+                return
+            if request.get("kind") != "chatInput":
+                return
+            request = request.get("request") or {}
+        request_id = request.get("id")
+        if not isinstance(request_id, str):
+            self.report_error(f"Input request without id in {sess[:8]}")
+            return
+        self.start_input(sess, f"ahp:{request_id}", owner, ts, "vscode-input")
+        if isinstance(outer_id, str):
+            self.input_aliases[(sess, f"ahp:{outer_id}")] = f"ahp:{request_id}"
+
+    def input_attention(self):
+        return (sum(a.display_status == "input" for a in self.agents.values()),
+                sum(session_status(st) == "input" for st in self.sessions.values()))
 
     @staticmethod
     def configure_agent(agent, data):
@@ -853,6 +970,23 @@ class Monitor:
         if kind in ("permission.requested", "permission.completed"):
             self.on_permission(sess, kind, data, owner, aid, ts)
             return
+        if kind in ("user_input.requested", "user_input.completed"):
+            request_id = data.get("requestId")
+            if not isinstance(request_id, str):
+                self.report_error(f"User input event without requestId in {sess[:8]}")
+                return
+            alias = f"cli:{request_id}"
+            if kind == "user_input.completed":
+                self.complete_input(sess, alias, ts)
+            else:
+                owner = owner or self.tool_owners.get(call)
+                if aid and owner is None:
+                    self.report_error(f"User input for an unmapped subagent in {sess[:8]}")
+                    return
+                key = f"tool:{call}" if call else alias
+                self.start_input(sess, key, owner, ts, "copilot-input", call)
+                self.input_aliases[(sess, alias)] = key
+            return
 
         if kind in ("subagent.started", "subagent.completed", "subagent.failed") and call:
             agent = self.agents.get(call)
@@ -860,6 +994,7 @@ class Monitor:
                 agent = Agent(call, sess, ts if kind == "subagent.started" else None)
                 self.agents[call] = agent
             agent.source = "cli"
+            self.adopt_inputs(agent)
             if isinstance(aid, str):
                 agent.agent_id = aid
                 self.by_agent_id[aid] = agent
@@ -880,6 +1015,7 @@ class Monitor:
             agent.last_event = ts
             agent.launched = True
             if kind != "subagent.started":
+                self.clear_inputs(sess, agent, before=ts)
                 agent.reported_completion(data, ts)
             if kind == "subagent.started":
                 if agent.started is None:
@@ -911,11 +1047,17 @@ class Monitor:
             if tool == "task":
                 agent = self.agents.setdefault(call, Agent(call, sess, ts, owner.call_id if owner else None))
                 agent.source = "cli"
+                self.adopt_inputs(agent)
             if tool in ("task", "read_agent", "write_agent"):
                 self.on_ready({"toolCallId": call, "toolInput": data.get("arguments")}, ts)
+            if owner is not None or not aid:
+                self.input_tool_started(sess, tool, call, ts, owner)
+            elif isinstance(tool, str) and tool.rsplit(".", 1)[-1] == "ask_user":
+                self.report_error(f"Question tool for an unmapped subagent in {sess[:8]}")
             return
 
         if kind == "tool.execution_complete" and call:
+            self.complete_input_tool(sess, call)
             owner = owner or self.tool_owners.get(call)
             self.tool_owners.pop(call, None)
             result = data.get("result") or {}
@@ -1012,6 +1154,7 @@ class Monitor:
                     state["in_tokens"] = metrics.get("prompt_tokens") or 0
                     state["cached_tokens"] = metrics.get("cache_read") or 0
             if kind == "session.shutdown":
+                self.clear_inputs(sess, all_owners=True)
                 state["status"], state["activity"], state["turn_done"] = "done", "", ts
                 state["model"] = data.get("currentModel") or state["model"]
                 state["in_tokens"] = data.get("currentTokens") or state["in_tokens"]
@@ -1036,6 +1179,8 @@ class Monitor:
             state["turn_out"] += state["out_tokens"]
             state["turn_cached"] += state["cached_tokens"]
         elif kind in ("abort", "session.error", "session.task_complete"):
+            if kind != "session.task_complete":
+                self.clear_inputs(sess)
             status = "cancelled" if kind == "abort" else ("failed" if kind == "session.error" or data.get("success") is False else "idle")
             state["status"], state["turn_done"] = status, ts
             state["activity"] = data.get("message") or data.get("reason") or ""
@@ -1093,9 +1238,16 @@ class Monitor:
 
         sess = session_of(channel)
         state = self.state_for(sess, ts)
+        if kind in AHP_INPUT_EVENTS:
+            self.on_ahp_input(sess, kind, action, ts)
+            return
         if sess in self.cli_sessions:
             if kind == "session/metaChanged":
                 self.on_meta(state, action.get("_meta") or {})
+            elif kind == "chat/toolCallComplete":
+                self.complete_input_tool(sess, f"{sess}/{action.get('toolCallId')}")
+            elif kind == "chat/turnComplete":
+                self.clear_inputs(sess, before=ts)
             return
         state["last_event"] = max(state["last_event"], ts)
 
@@ -1103,9 +1255,12 @@ class Monitor:
             if action.get("toolName"):
                 state["tools"][action["toolName"]] += 1
             self.on_start(sess, action, ts)
+            if action.get("toolCallId"):
+                self.input_tool_started(sess, action.get("toolName"), f"{sess}/{action['toolCallId']}", ts)
         elif kind == "chat/toolCallReady":
             self.on_ready(action, ts)
         elif kind == "chat/toolCallComplete":
+            self.complete_input_tool(sess, f"{sess}/{action.get('toolCallId')}")
             self.on_complete(action, ts)
         elif kind == "chat/responsePart":
             part = action.get("part") or {}
@@ -1123,6 +1278,7 @@ class Monitor:
             if (msg.get("origin") or {}).get("kind") == "systemNotification":
                 self.on_notification(str(msg.get("text") or ""), ts)
         elif kind == "chat/turnComplete":
+            self.clear_inputs(sess)
             state["turn_done"] = ts
             state["status"] = "idle"
         elif kind == "session/activityChanged":
@@ -1149,7 +1305,7 @@ class Monitor:
             "status": "unknown", "title": "", "cwd": "", "tools": collections.Counter(),
             "pending_tools": set(), "cli_turn_base": 0.0,
             "session_direct_aiu": None, "cli_direct_base": None,
-            "session_aiu_known": False, "turn_aiu_known": False, "permissions": {},
+            "session_aiu_known": False, "turn_aiu_known": False, "permissions": {}, "inputs": {},
         })
 
     @staticmethod
@@ -1323,6 +1479,17 @@ class Monitor:
 
     def on_subagent_channel(self, channel, kind, action, ts):
         call_id = channel.rsplit("/", 1)[-1]
+        if kind in AHP_INPUT_EVENTS:
+            owner = self.agent_for_chat(channel)
+            if owner:
+                self.on_ahp_input(owner.session, kind, action, ts, owner)
+            else:
+                self.report_error("Input event on an unmapped subagent channel")
+            return
+        if kind == "chat/turnComplete":
+            owner = self.agent_for_chat(channel)
+            if owner:
+                self.clear_inputs(owner.session, owner, before=ts)
         agent = self.agents.get(call_id)
         if agent is None or agent.session in self.cli_sessions:
             return
@@ -1331,6 +1498,8 @@ class Monitor:
             tool = action.get("toolName")
             if tool:
                 agent.tool_started(action.get("toolCallId"), tool, ts)
+                if action.get("toolCallId"):
+                    self.input_tool_started(agent.session, tool, f"{agent.session}/{action['toolCallId']}", ts, agent)
             if tool == "task":                      # this agent delegates further
                 child_id = action.get("toolCallId")
                 if child_id and child_id not in self.agents:
@@ -1338,6 +1507,7 @@ class Monitor:
         elif kind == "chat/toolCallReady":
             self.on_ready(action, ts)
         elif kind == "chat/toolCallComplete":
+            self.complete_input_tool(agent.session, f"{agent.session}/{action.get('toolCallId')}")
             result = action.get("result") or {}
             success = action.get("success")
             if not isinstance(success, bool) and isinstance(result.get("isError"), bool):
@@ -1450,10 +1620,10 @@ def expand_target_list(targets):
 # rendering helpers
 # ---------------------------------------------------------------------------
 
-STATUS_GLYPH = {"running": "\u25cf", "starting": "\u25cb", "idle": "\u25cc", "waiting": "\u23f8",
+STATUS_GLYPH = {"running": "\u25cf", "starting": "\u25cb", "idle": "\u25cc", "waiting": "\u23f8", "input": "\u2328",
                 "done": "\u2713", "failed": "\u2717", "cancelled": "\u2298", "orphan": "?", "unknown": "?"}
-STATUS_ORDER = {status: i for i, status in enumerate(("waiting", "running", "starting", "idle", "failed", "cancelled", "done", "orphan"))}
-STATUS_LEGEND = " \u23f8 approval  \u25cf running  \u25cb starting  \u25cc idle  \u2713 done  \u2717 failed  \u2298 cancelled  ? unknown "
+STATUS_ORDER = {status: i for i, status in enumerate(("input", "waiting", "running", "starting", "idle", "failed", "cancelled", "done", "orphan"))}
+STATUS_LEGEND = " \u2328 input  \u23f8 approval  \u25cf running  \u25cb starting  \u25cc idle  \u2713 done  \u2717 failed  \u2298 cancelled  ? unknown "
 SOURCE_GLYPH = {"cli": ">_", "vscode": "\u25c7"}
 
 
@@ -1626,7 +1796,7 @@ def agent_line(a, now, width, prefix=""):
     available = max(0, width - 1 - text_width(text))
     prefix = slice_cells(prefix, available)
     task_w = max(0, available - text_width(prefix))
-    label = ("[approval] " if status == "waiting" else "") + a.label
+    label = ({"waiting": "[approval] ", "input": "[INPUT] "}.get(status, "")) + a.label
     return status, slice_cells(text + prefix + clip(label, task_w), max(0, width - 1))
 
 
@@ -1651,7 +1821,8 @@ def session_header(mon: Monitor, sid, kids, now, collapsed, width):
     name_width = min(name_width, max(4, width - 26))
     parts = [f"{mark} {fit_cell(source, 2)} {fit_cell(mon.session_label(sid), name_width)} [{fit_cell(sid[:8], 8)}]"]
     if width >= 60:
-        parts.append(fit_cell(session_status(st) if st else "unknown", 9))
+        status = session_status(st) if st else "unknown"
+        parts.append(fit_cell("INPUT" if status == "input" else status, 9))
     if width >= 132:
         parts.append(fit_cell(st.get("model") or "", 16))
     if width >= 100:
@@ -1664,6 +1835,10 @@ def session_header(mon: Monitor, sid, kids, now, collapsed, width):
         parts.append(fit_cell(turn, 14, right=True))
     head = "  ".join(parts) + "  "
     activity = st.get("activity") or st.get("title") or ""
+    if st and session_status(st) == "input":
+        activity = "INPUT: answer needed"
+    elif any(k.display_status == "input" for k in kids):
+        activity = "INPUT: agent needs answer"
     head += clip(activity, max(0, width - 1 - text_width(head)))
     return slice_cells(head, max(0, width - 1))
 
@@ -1698,6 +1873,10 @@ def usage_lines(mon: Monitor, width, sessions=None):
 
 def footer_lines(mon: Monitor, width, sessions=None):
     lines = usage_lines(mon, width, sessions)
+    input_agents, input_sessions = mon.input_attention()
+    if input_agents or input_sessions:
+        lines.insert(0, clip(f"INPUT needed: {input_sessions} sessions, {input_agents} agents. "
+                             "Answer in Copilot/VS Code; a:all reveals filtered entries.", width))
     if mon.errors:
         lines.append(clip(f"Warning ({len(mon.errors)}): {mon.errors[-1]}", width))
     return lines
@@ -1718,7 +1897,11 @@ def build_display(mon: Monitor, rows, now, width, tree, collapsed, sessions=None
     items = []
     for sid in order:
         kids = grouped[sid]
-        items.append(("session", sid, "session", session_header(mon, sid, kids, now, collapsed, width)))
+        state = mon.sessions.get(sid)
+        status = session_status(state) if state else "unknown"
+        if any(k.display_status == "input" for k in kids):
+            status = "input"
+        items.append(("session", sid, status, session_header(mon, sid, kids, now, collapsed, width)))
         if sid in collapsed:
             continue
         children = {}
@@ -1761,10 +1944,13 @@ def filter_hint(show_done, activity):
 
 def table_row_style(kind, status, selected, use_color):
     import curses
+    if status == "input":
+        color = curses.color_pair(8 if selected else 7) if use_color else (curses.A_REVERSE if selected else 0)
+        return color | curses.A_BOLD | (curses.A_UNDERLINE if kind == "session" else 0)
     if selected:
         return (curses.color_pair(6) if use_color else curses.A_REVERSE) | curses.A_BOLD
     if kind == "session":
-        return (curses.color_pair(3) if use_color else 0) | curses.A_BOLD | curses.A_UNDERLINE
+        return (curses.color_pair(2 if status == "waiting" else 3) if use_color else 0) | curses.A_BOLD | curses.A_UNDERLINE
     pairs = {"running": 1, "starting": 2, "idle": 3, "done": 4, "failed": 5, "cancelled": 2, "waiting": 2}
     return curses.color_pair(pairs.get(status, 0)) if use_color else 0
 
@@ -1796,6 +1982,8 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
             curses.init_pair(4, curses.COLOR_BLUE, -1)
             curses.init_pair(5, curses.COLOR_RED, -1)
             curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_WHITE)
+            curses.init_pair(7, curses.COLOR_MAGENTA, -1)
+            curses.init_pair(8, curses.COLOR_BLACK, curses.COLOR_MAGENTA)
 
         show_done = all_done
         current_sort = sort_key
@@ -1829,7 +2017,10 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
             running, starting, idle, done = mon.counts(rows)
             total = aic_summary(mon)
             waiting = sum(a.display_status == "waiting" for a in rows)
-            title = f" agenttop {version()}{' | ' + total if total else ''}  {datetime.now().strftime('%H:%M:%S')} "
+            input_agents, input_sessions = mon.input_attention()
+            attention = f"INPUT {input_agents + input_sessions}" if input_agents or input_sessions else ""
+            title = (f" agenttop {version()}{' | ' + attention if attention else ''}"
+                     f"{' | ' + total if total else ''}  {datetime.now().strftime('%H:%M:%S')} ")
             summary = (f" running {running}  starting {starting}  idle {idle}  done {done} "
                        f" waiting {waiting}"
                        f"  | sessions {len(sessions)}  logs {len(mon.files)}  sort:{current_sort}"
@@ -1844,6 +2035,10 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                          "diverged": 2, "restart": 2}.get(notice.status, 6)
                 stdscr.addnstr(0, text_width(left), right, len(right),
                                (curses.color_pair(color) if use_color else curses.A_REVERSE) | curses.A_BOLD)
+                if attention and attention in left:
+                    column = text_width(left[:left.index(attention)])
+                    stdscr.addnstr(0, column, attention, len(attention),
+                                   (curses.color_pair(8) if use_color else curses.A_REVERSE) | curses.A_BOLD)
             except curses.error:
                 pass
 
@@ -1860,6 +2055,8 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                     "Idle background agents can be resumed with write_agent.",
                     "STARTED is local date/time; agent details show seconds and UTC offset.",
                     "Approval waits are excluded by 'active'; use 'all' or '2h' to see them.",
+                    "Magenta INPUT / keyboard symbol: answer needed in Copilot/VS Code.",
+                    "The INPUT badge includes hidden loaded sessions/agents; 'active' excludes input waits.",
                     "AIC total sums loaded sessions once; 'known' means some session totals are missing.",
                     "Agent details: Up/Down, Page Up/Down, Home/End scroll through available telemetry.",
                     "--source cli|vscode|all selects the log source at startup.",
@@ -1909,7 +2106,9 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                         pass
                 for j, text in enumerate(foot):
                     try:
-                        stdscr.addnstr(height - 1 - len(foot) + j, 0, text, width - 1, curses.A_DIM)
+                        attr = ((curses.color_pair(7) if use_color else 0) | curses.A_BOLD
+                                if text.startswith("INPUT needed:") else curses.A_DIM)
+                        stdscr.addnstr(height - 1 - len(foot) + j, 0, text, width - 1, attr)
                     except curses.error:
                         pass
 
@@ -2029,6 +2228,14 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
             checker.close()
 
 
+def input_info(inputs, now):
+    if not inputs:
+        return {}
+    started = min(info["started"] for info in inputs.values())
+    return {"since": datetime.fromtimestamp(started, timezone.utc).isoformat(),
+            "wait_seconds": max(0.0, now - started)}
+
+
 def agent_telemetry(agent, now):
     fields = {}
     if agent.configuration:
@@ -2062,6 +2269,8 @@ def agent_telemetry(agent, now):
         }
     if agent.last_error:
         fields["last_error"] = agent.last_error
+    if agent.display_status == "input":
+        fields["input_wait"] = input_info(agent.inputs, now)
     return fields
 
 
@@ -2073,6 +2282,9 @@ def detail_entries(agent, now):
         ("type", agent.agent_type), ("model", agent.model),
         ("mode / status", f"{'background' if agent.mode == 'background' else 'sync'} / {agent.display_status}"),
     ]
+    if agent.inputs:
+        started = min(info["started"] for info in agent.inputs.values())
+        info.append(("awaiting answer", f"{fmt_elapsed(max(0.0, now - started))}; answer in Copilot/VS Code"))
     if agent.permissions:
         info.append(("awaiting approval", ", ".join(
             f"{item['kind']} ({fmt_elapsed(max(0.0, now - item['started']))})"
@@ -2176,7 +2388,8 @@ def run_once(mon: Monitor, show_done: bool, sort_key: str, as_json: bool, tree=T
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "logs": mon.files,
             "counts": {**dict(zip(("running", "starting", "idle", "done"), mon.counts(rows))),
-                       "waiting": sum(a.display_status == "waiting" for a in rows)},
+                       "waiting": sum(a.display_status == "waiting" for a in rows),
+                       "input": sum(a.display_status == "input" for a in rows)},
             "errors": mon.errors,
             "agents": [
                 {
@@ -2216,6 +2429,7 @@ def run_once(mon: Monitor, show_done: bool, sort_key: str, as_json: bool, tree=T
                     "session_aiu_self": st["session_direct_aiu"],
                     "session_aiu": round(st["session_aiu"], 4),
                     "premium_quota_used_pct": st["premium_pct"],
+                    **({"input_wait": input_info(st["inputs"], now)} if session_status(st) == "input" else {}),
                 }
                 for sid, st in mon.sessions.items() if sid in sessions
             },
@@ -2223,6 +2437,9 @@ def run_once(mon: Monitor, show_done: bool, sort_key: str, as_json: bool, tree=T
         total, complete = mon.aic_total()
         if total is not None:
             payload["totals"] = {"aic": total, "complete": complete, "scope": "loaded_sessions"}
+        input_agents, input_sessions = mon.input_attention()
+        payload["attention"] = {"input_agents": input_agents, "input_sessions": input_sessions,
+                                "scope": "loaded_sessions"}
         json.dump(payload, sys.stdout, indent=2)
         print()
         return
@@ -2230,7 +2447,9 @@ def run_once(mon: Monitor, show_done: bool, sort_key: str, as_json: bool, tree=T
     running, starting, idle, done = mon.counts(rows)
     total = aic_summary(mon)
     waiting = sum(a.display_status == "waiting" for a in rows)
-    print(f"agenttop {version()}{' | ' + total if total else ''}"
+    input_agents, input_sessions = mon.input_attention()
+    attention = f" | INPUT {input_agents + input_sessions}" if input_agents or input_sessions else ""
+    print(f"agenttop {version()}{attention}{' | ' + total if total else ''}"
           f"  running {running}  starting {starting}  idle {idle}  done {done}  waiting {waiting}"
           f"  | sessions {len(sessions)}  logs {len(mon.files)}"
           f"  | activity:{ACTIVITY_FILTERS[activity]} finished:{'show' if show_done else 'hide'}")

@@ -47,6 +47,9 @@ Unselected session headers use a subtle cyan underline instead of bright bars
 of different lengths. The selected row has the same full-width highlight whether
 it is a session or an agent. In monochrome terminals, selection uses reverse video.
 Numeric columns are right-aligned and separated from neighboring fields.
+Magenta highlights a session or agent that needs an answer. An affected group
+also highlights when a displayed child is waiting, even while collapsed.
+The keyboard symbol (U+2328) and `INPUT` text make this recognizable without color.
 
 As the terminal narrows, lower-priority columns disappear to preserve room for
 the task description. Widen the terminal or open details to see hidden values.
@@ -148,6 +151,7 @@ The flat view contains agents only.
 | `starting` | A delegation was observed but launch is not yet confirmed |
 | `running` | The latest relevant events indicate active work |
 | `waiting` | An unresolved approval request is recorded; excluded by the strict active filter |
+| `input` | An answer is needed in Copilot/VS Code; magenta, also excluded by the strict active filter |
 | `idle` | Waiting between turns; a resumable agent can be used again |
 | `done` | Completion recorded for a terminal agent/session |
 | `failed` | A failure was recorded |
@@ -188,6 +192,25 @@ errors, and average/maximum observed tool-call durations. A pending permission
 shows the pause symbol (U+23F8) in the overview. Hook-resolved permissions do not
 create a user-wait state. Missing start/completion pairs never produce guessed
 timings.
+
+### Questions that need your answer
+
+User questions are separate from permission approvals. A magenta `INPUT` marker
+means a dedicated question/input request is unresolved. The detail view shows
+how long an agent has been waiting. Complete the answer in the originating
+Copilot/VS Code chat; agenttop never submits answers.
+
+The top `INPUT N` badge counts all loaded waiting sessions and agents, even if
+activity/search filters hide their rows. Set `a activity:all` to find them.
+A group may highlight because one of its children needs input; this does not
+mean the main agent is also blocked. Each waiting target is counted once.
+
+The parser uses dedicated CLI/SDK/VS Code request and completion signals, not
+the text of an activity message. A stale `ask_user` activity label alone is
+therefore not considered a pending question. Native input completion can be
+live-only in SDK versions; a matching question-tool completion can also resolve
+the wait. Missing completion/history records can still leave a pending state.
+Ordinary VS Code client-tool execution is not treated as user input.
 
 Reported completion totals are kept separate from observed counters.
 `sum N` in the token column means total input+output usage from a reported
@@ -253,11 +276,15 @@ Top-level fields:
 | `version` | Local revision/fingerprint and any dirty/shallow marker |
 | `generated_at` | UTC snapshot timestamp |
 | `logs` | Local source file paths |
-| `counts` | Visible running, starting, idle, approval-waiting and terminal agent counts |
+| `counts` | Visible running, starting, idle, approval-waiting, input-waiting and terminal agent counts |
 | `agents` | Agent state, identifiers, timing, source, tools and usage |
 | `sessions` | Session-ID-keyed metadata, status and usage |
 | `errors` | Read/parse warnings; check this before treating a snapshot as complete |
 | `totals` | When known: AIC sum, completeness flag and scope `loaded_sessions`, including hidden sessions |
+| `attention` | Input-waiting session/agent counts across all loaded sessions, including hidden targets |
+
+Waiting sessions/agents include `input_wait.since` (UTC ISO timestamp) and
+`input_wait.wait_seconds`. This metadata does not contain question or answer text.
 
 `counts.done` includes failed and cancelled agents. Inspect each agent's `status`
 when the distinction matters.
