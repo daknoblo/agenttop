@@ -34,8 +34,8 @@ reading session logs. See [updating](installation.md#updating).
   update availability independently of the left-hand statistics.
 - **Session rows:** data source, project/directory label, shortened session ID,
   recorded status, model, activity/title and available usage.
-- **Agent rows:** recorded lifecycle state, runtime, quiet time, shortened ID,
-  agent type, execution mode and tool activity.
+- **Agent rows:** recorded lifecycle state, local start date/time, runtime,
+  quiet time, shortened ID, agent type, execution mode and tool activity.
 - **Wide terminals:** token and AIU columns appear at 132 columns or more.
 - **Footer:** usage for up to three matching sessions with usage data, plus
   read/parse warnings and update-check details when present.
@@ -63,6 +63,7 @@ agenttop --source vscode
 agenttop --session aaaaaaaa
 agenttop --search parser
 agenttop --sort idle
+agenttop --sort start
 agenttop --all-done
 ```
 
@@ -105,6 +106,19 @@ The flat view contains agents only.
 Runtime is wall-clock time since delegation, not CPU time. It continues for idle
 resumable agents until they are closed. Quiet time is the time since the last
 recorded event, not proof that the underlying process is hung.
+
+The `STARTED (local)` column shows `YYYY-MM-DD HH:MM` in the monitor's local
+timezone, including the date for agents that have been running across days.
+Open agent details with Enter for seconds and an explicit UTC offset; the
+completion timestamp there also includes its full date. Text snapshots and
+both tree/flat views use the same start column. On narrow terminals, later
+columns are clipped so rows do not wrap.
+
+This timestamp is the first observed delegation/start, not an OS process
+creation measurement. A resumed agent keeps its original start. If the log
+starts mid-session, earlier history cannot be inferred. An unavailable timestamp
+is `-` in the table and `null` in JSON; `started_at` in JSON otherwise stays UTC.
+Use `--sort start` (or cycle `s` to `start`) to list newest agents first.
 
 One-shot background agents finish when completion is recorded. Resumable agents
 can become idle and return to running on an accepted follow-up message.

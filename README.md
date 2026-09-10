@@ -14,11 +14,11 @@ and usage figures (not a captured session):
 
 ```text
  agenttop r42.0123abcd  12:00:00  running 1  starting 0  idle 1  done 1  | AIU total 12  | sessions 1  logs 1  sort:runtime  tree +done
-S      RUNTIME      QUIET AGENT    TYPE            MOD  TOOLS         TOKENS in/out     AIU TASK
+S  STARTED (local)       RUNTIME      QUIET AGENT    TYPE            MOD  TOOLS         TOKENS in/out     AIU TASK
 ▼ >_ example-app@main [aaaaaaaa] running example-model · Update example documentation · 3 agents (2 live, 1 running)
-●      2m 00s         3s 11111111 general-purpose bg   4 · view      12k/1k         1.00 ├─ Update example documentation
-◌      1m 30s        30s 22222222 explore         bg   2 · glob       6k/1k         0.50 ├─ Find example files
-✓         45s          - 33333333 code-review     sync 3 · view       8k/1k         0.50 └─ Review example tests
+●  2026-01-01 11:58      2m 00s         3s 11111111 general-purpose bg   4 · view      12k/1k         1.00 ├─ Update example documentation
+◌  2026-01-01 11:58      1m 30s        30s 22222222 explore         bg   2 · glob       6k/1k         0.50 ├─ Find example files
+✓  2026-01-01 11:59         45s          - 33333333 code-review     sync 3 · view       8k/1k         0.50 └─ Review example tests
 
 aaaaaaaa example-model ctx 16k/128k (8k cached) turn 32k in / 4k out AIU turn 4.00 (self 2.00 + agents 2.00) session 12
  q quit  d done  t tree  s sort  f focus  / search  ? help  enter open  ↑↓ move
@@ -101,6 +101,7 @@ agenttop --flat               # flat list instead of the per-session tree
 agenttop --all-done           # include finished sessions and agents
 agenttop --session aaaaaaaa   # restrict to one session (example id prefix)
 agenttop --search parser      # case-insensitive session/task/model search
+agenttop --sort start         # newest delegated agents first
 agenttop --sort status        # choose initial sort in TUI or snapshots
 agenttop --log <file|dir>     # AHP log, CLI events.jsonl, or a containing directory
 agenttop --cli-dir ~/my-copilot/session-state
@@ -216,6 +217,7 @@ The `r` key refreshes logs only and does not trigger extra update checks.
 | Column | Meaning |
 | --- | --- |
 | `S` | status: `●` running, `○` starting, `◌` idle, `✓` done, `✗` failed, `⊘` cancelled, `?` unknown |
+| `STARTED (local)` | first observed delegation/start time as `YYYY-MM-DD HH:MM` in your local timezone; details include seconds and UTC offset |
 | `RUNTIME` | wall clock since the agent was delegated |
 | `QUIET` | time since the last event for this agent — how long you have been waiting |
 | `AGENT` | short `agent_id` (background) or tool call id (sync) |
@@ -224,6 +226,13 @@ The `r` key refreshes logs only and does not trigger extra update checks.
 | `TOOLS` | total tool calls and the most used tool |
 | `TOKENS` | context / output tokens (shown from 132 columns of width) |
 | `AIU` | AI units consumed by that agent |
+
+The start column is present in tree, flat and text snapshots. It retains the
+original observed start when a resumable agent receives another turn.
+If earlier log events are missing, it is the earliest start/delegation event
+available to this monitor, not a reconstructed OS process creation time.
+JSON `started_at` remains an ISO-8601 UTC timestamp; unknown timestamps remain
+`null` (shown as `-` in the table). Use `--sort start` for newest-first ordering.
 
 ## How it works
 

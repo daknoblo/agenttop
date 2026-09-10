@@ -467,8 +467,8 @@ class Agent:
         return (self.agent_id or self.call_id.rsplit("/", 1)[-1].removeprefix("call_"))[:8]
 
     def runtime(self, now: float) -> float:
-        end = self.ended if self.ended else now
-        return max(0.0, end - (self.started or now))
+        end = self.ended if self.ended is not None else now
+        return max(0.0, end - (self.started if self.started is not None else end))
 
     def finish(self, when, status="done"):
         if self.ended is None:
@@ -627,7 +627,7 @@ class Monitor:
         if kind in ("subagent.started", "subagent.completed", "subagent.failed") and call:
             agent = self.agents.get(call)
             if agent is None:
-                agent = Agent(call, sess, ts)
+                agent = Agent(call, sess, ts if kind == "subagent.started" else None)
                 self.agents[call] = agent
             agent.source = "cli"
             if isinstance(aid, str):
@@ -643,6 +643,8 @@ class Monitor:
             agent.last_event = ts
             agent.launched = True
             if kind == "subagent.started":
+                if agent.started is None:
+                    agent.started = ts
                 agent.status, agent.ended = "running", None
             elif kind == "subagent.failed":
                 agent.finish(ts, "failed")
@@ -1204,6 +1206,13 @@ def fmt_clock(ts) -> str:
     return datetime.fromtimestamp(ts).strftime("%H:%M:%S") if ts else "-"
 
 
+def fmt_timestamp(ts, precise=False) -> str:
+    if ts is None:
+        return "-"
+    local = datetime.fromtimestamp(ts).astimezone()
+    return local.isoformat(sep=" ", timespec="seconds") if precise else local.strftime("%Y-%m-%d %H:%M")
+
+
 def clip(text: str, width: int) -> str:
     text = " ".join((text or "").split())
     if width <= 0:
@@ -1211,37 +1220,39 @@ def clip(text: str, width: int) -> str:
     return text if len(text) <= width else text[: max(0, width - 1)] + "\u2026"
 
 
-COLS = {"rt": 11, "quiet": 10, "id": 8, "type": 15, "mode": 4, "tools": 13,
+COLS = {"started": 16, "rt": 11, "quiet": 10, "id": 8, "type": 15, "mode": 4, "tools": 13,
         "tok": 12, "aiu": 7}
 WIDE_AT = 132                                       # show TOKENS/AIU columns from here
 
 
 def table_header(width):
     c = COLS
-    head = (f"{'S':<2} {'RUNTIME':>{c['rt']}} {'QUIET':>{c['quiet']}} {'AGENT':<{c['id']}} "
+    head = (f"{'S':<2} {'STARTED (local)':<{c['started']}} {'RUNTIME':>{c['rt']}} "
+            f"{'QUIET':>{c['quiet']}} {'AGENT':<{c['id']}} "
             f"{'TYPE':<{c['type']}} {'MOD':<{c['mode']}} {'TOOLS':<{c['tools']}} ")
     if width >= WIDE_AT:
         head += f"{'TOKENS in/out':<{c['tok']}} {'AIU':>{c['aiu']}} "
-    return head + "TASK"
+    return (head + "TASK")[:max(0, width - 1)]
 
 
 def agent_line(a, now, width, prefix=""):
     c = COLS
-    fixed = 2 + 1 + c["rt"] + 1 + c["quiet"] + 1 + c["id"] + 1 + c["type"] + 1 + c["mode"] + 1 + c["tools"] + 1
     status = a.status
     quiet = fmt_dur(now - (a.last_event or now)) if a.ended is None else "-"
     mode = "bg" if a.mode == "background" else "sync"
     text = (
-        f"{STATUS_GLYPH.get(status, '?'):<2} {fmt_dur(a.runtime(now)):>{c['rt']}} {quiet:>{c['quiet']}} "
+        f"{STATUS_GLYPH.get(status, '?'):<2} {fmt_timestamp(a.started):<{c['started']}} "
+        f"{fmt_dur(a.runtime(now)):>{c['rt']}} {quiet:>{c['quiet']}} "
         f"{a.short_id:<{c['id']}} {clip(a.agent_type or '-', c['type']):<{c['type']}} "
         f"{mode:<{c['mode']}} {clip(a.tool_summary, c['tools']):<{c['tools']}} "
     )
     if width >= WIDE_AT:
         tok = f"{fmt_tokens(a.in_tokens)}/{fmt_tokens(a.out_tokens)}" if a.in_tokens else "-"
         text += f"{tok:<{c['tok']}} {fmt_aiu(a.aiu):>{c['aiu']}} "
-        fixed += c["tok"] + 1 + c["aiu"] + 1
-    task_w = max(14, width - fixed - len(prefix))
-    return status, text + f"{prefix}{clip(a.label, task_w)}"
+    available = max(0, width - 1 - len(text))
+    prefix = prefix[:available]
+    task_w = max(0, available - len(prefix))
+    return status, (text + prefix + clip(a.label, task_w))[:max(0, width - 1)]
 
 
 def build_rows(mon: Monitor, rows, now, width):
@@ -1439,6 +1450,7 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                     "r: rescan logs now    ?: help    q: back / quit",
                     f"Sources: {SOURCE_GLYPH['cli']} CLI history, {SOURCE_GLYPH['vscode']} VS Code AHP",
                     "Idle background agents can be resumed with write_agent.",
+                    "STARTED is local date/time; agent details show seconds and UTC offset.",
                     "--source cli|vscode|all selects the log source at startup.",
                     "Only recorded events are shown; status is not a process health check.",
                     "Updates: checked at startup and every eight hours; --no-update-check disables.",
@@ -1610,9 +1622,8 @@ def render_detail(stdscr, agent, height, width):
         ("description", agent.description or "-"),
         ("type / model", f"{agent.agent_type or '-'} / {agent.model or 'inherited'}"),
         ("mode / status", f"{'background' if agent.mode == 'background' else 'sync'} / {agent.status}"),
-        ("started", datetime.fromtimestamp(agent.started).strftime("%Y-%m-%d %H:%M:%S")
-                    if agent.started else "?"),
-        ("ended", fmt_clock(agent.ended)),
+        ("started", fmt_timestamp(agent.started, precise=True)),
+        ("ended", fmt_timestamp(agent.ended, precise=True)),
         ("runtime", fmt_dur(agent.runtime(now))),
         ("quiet since", fmt_dur(now - (agent.last_event or now)) if agent.ended is None else "-"),
         ("tool calls", f"{sum(agent.tools.values())}  ({tools})"),
@@ -1701,8 +1712,8 @@ def run_once(mon: Monitor, show_done: bool, sort_key: str, as_json: bool, tree=T
                     "parent_call_id": a.parent,
                     "name": a.name, "description": a.description, "agent_type": a.agent_type,
                     "model": a.model, "mode": a.mode, "status": a.status, "source": a.source,
-                    "started_at": datetime.fromtimestamp(a.started, timezone.utc).isoformat() if a.started else None,
-                    "ended_at": datetime.fromtimestamp(a.ended, timezone.utc).isoformat() if a.ended else None,
+                    "started_at": datetime.fromtimestamp(a.started, timezone.utc).isoformat() if a.started is not None else None,
+                    "ended_at": datetime.fromtimestamp(a.ended, timezone.utc).isoformat() if a.ended is not None else None,
                     "runtime_seconds": round(a.runtime(now), 1),
                     "quiet_seconds": round(now - (a.last_event or now), 1) if a.ended is None else None,
                     "runtime_human": fmt_dur(a.runtime(now)),

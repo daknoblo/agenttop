@@ -4,6 +4,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import runpy
 import shutil
 import signal
@@ -547,6 +548,88 @@ class UpdateIndicatorTests(unittest.TestCase):
                 self.assertTrue(tui.call_args.kwargs["check_updates"])
 
 
+class StartTimeTests(unittest.TestCase):
+    def setUp(self):
+        self.started = datetime(2026, 9, 10, 9, 24, 7).timestamp()
+        self.now = self.started + 180
+        self.agent = Agent("call_example", "example-session", self.started)
+        self.agent.description = "An example task with a longer description"
+        self.agent.agent_type = "explore"
+        self.agent.launched = True
+        self.mon = Monitor()
+        self.mon.agents[self.agent.call_id] = self.agent
+        self.mon.state_for(self.agent.session, self.started)
+
+    def test_started_column_has_local_date_and_time(self):
+        header = APP["table_header"](132)
+        _, row = APP["agent_line"](self.agent, self.now, 132)
+        start = header.index("STARTED (local)")
+        self.assertEqual(row[start:start + 16], "2026-09-10 09:24")
+        self.assertIn("RUNTIME", header)
+        self.assertIn("TOKENS in/out", header)
+        self.assertIn("An example", row)
+
+    def test_width_limits_and_tree_indentation(self):
+        for width in (0, 1, 20, 60, 80, 100, 120, 132, 160, 200):
+            with self.subTest(width=width):
+                header = APP["table_header"](width)
+                _, row = APP["agent_line"](self.agent, self.now, width, "   \u2514\u2500 ")
+                self.assertLessEqual(len(header), max(0, width - 1))
+                self.assertLessEqual(len(row), max(0, width - 1))
+                if width >= 120:
+                    self.assertIn("   \u2514\u2500 ", row)
+                    self.assertIn("2026-09-10 09:24", row)
+
+    def test_tree_flat_and_plain_output_include_start(self):
+        for tree in (False, True):
+            with self.subTest(tree=tree):
+                header, rows = APP["build_display"](self.mon, [self.agent], self.now, 160, tree, set())
+                self.assertIn("STARTED (local)", header)
+                agent_rows = [row for row in rows if row[0] == "agent"]
+                self.assertIn("2026-09-10 09:24", agent_rows[0][3])
+                output = io.StringIO()
+                with patch.object(self.mon, "refresh"), contextlib.redirect_stdout(output):
+                    APP["run_once"](self.mon, True, "start", False, tree=tree)
+                self.assertIn("STARTED (local)", output.getvalue())
+                self.assertIn("2026-09-10 09:24", output.getvalue())
+
+    def test_details_include_seconds_offset_and_end_date(self):
+        self.agent.finish(datetime(2026, 9, 11, 10, 25, 8).timestamp())
+        screen = Mock()
+        APP["render_detail"](screen, self.agent, 40, 160)
+        rendered = [call.args[2] for call in screen.addnstr.call_args_list]
+        self.assertTrue(any(re.match(r"2026-09-10 09:24:07[+-]\d\d:\d\d$", text) for text in rendered))
+        self.assertTrue(any(re.match(r"2026-09-11 10:25:08[+-]\d\d:\d\d$", text) for text in rendered))
+
+    def test_json_keeps_utc_and_missing_start_is_not_invented(self):
+        for started in (self.started, 0, None):
+            with self.subTest(started=started):
+                self.agent.started = started
+                output = io.StringIO()
+                with patch.object(self.mon, "refresh"), contextlib.redirect_stdout(output):
+                    APP["run_once"](self.mon, True, "start", True)
+                value = json.loads(output.getvalue())["agents"][0]["started_at"]
+                if started is None:
+                    self.assertIsNone(value)
+                    self.assertEqual(APP["fmt_timestamp"](started), "-")
+                else:
+                    self.assertEqual(datetime.fromisoformat(value).timestamp(), started)
+                    self.assertTrue(value.endswith("+00:00"))
+
+    def test_start_sort_is_newest_first(self):
+        newer = Agent("call_newer", self.agent.session, self.started + 30)
+        self.mon.agents[newer.call_id] = newer
+        rows, _ = self.mon.snapshot(True, "start")
+        self.assertEqual([a.call_id for a in rows], [newer.call_id, self.agent.call_id])
+
+    def test_runtime_accepts_epoch_zero_but_does_not_guess_unknown_start(self):
+        self.agent.started = 0
+        self.agent.ended = 60
+        self.assertEqual(self.agent.runtime(120), 60)
+        self.agent.started = None
+        self.assertEqual(self.agent.runtime(120), 0)
+
+
 class MonitorTests(unittest.TestCase):
     def setUp(self):
         self.mon = Monitor()
@@ -636,6 +719,20 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(agent.status, "done")
         self.assertIsNotNone(agent.ended)
         self.assertEqual(self.mon.sessions["session-a"]["session_aiu"], 4)
+
+    def test_agent_start_is_preserved_when_resumed(self):
+        agent = self.launch()
+        started = agent.started
+        self.feed("subagent.completed", {"toolCallId": "call_task"}, AID)
+        self.feed("subagent.started", {"toolCallId": "call_task", "executionMode": "background"}, AID)
+        self.assertEqual(agent.started, started)
+
+    def test_completion_without_launch_does_not_invent_start_time(self):
+        self.feed("subagent.completed", {"toolCallId": "call_unknown"}, AID)
+        agent = self.mon.by_agent_id[AID]
+        self.assertIsNone(agent.started)
+        self.assertEqual(agent.runtime(self.now + 100), 0)
+        self.assertEqual(APP["fmt_timestamp"](agent.started), "-")
 
     def test_launch_ack_does_not_reopen_idle_agent(self):
         agent = self.launch()
