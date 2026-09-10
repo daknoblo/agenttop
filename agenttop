@@ -35,6 +35,7 @@ import sys
 import textwrap
 import threading
 import time
+import unicodedata
 from datetime import datetime, timezone
 from functools import lru_cache
 
@@ -1529,59 +1530,104 @@ def fmt_timestamp(ts, precise=False) -> str:
     return local.isoformat(sep=" ", timespec="seconds") if precise else local.strftime("%Y-%m-%d %H:%M")
 
 
-def clip(text: str, width: int) -> str:
-    text = " ".join((text or "").split())
+@lru_cache(maxsize=4096)
+def cell_width(char):
+    if unicodedata.category(char) in ("Mn", "Me", "Cf"):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+
+
+def text_width(text):
+    return sum(cell_width(char) for char in text)
+
+
+def slice_cells(text, width):
     if width <= 0:
         return ""
-    return text if len(text) <= width else text[: max(0, width - 1)] + "\u2026"
+    used = 0
+    result = []
+    for char in text:
+        size = cell_width(char)
+        if used + size > max(0, width):
+            break
+        result.append(char)
+        used += size
+    return "".join(result)
 
 
-COLS = {"started": 16, "rt": 11, "quiet": 10, "id": 8, "type": 15, "mode": 4, "tools": 13, "model": 16,
+def clip(text: str, width: int) -> str:
+    text = " ".join((text or "").split())
+    text = "".join(char for char in text if unicodedata.category(char) != "Cc")
+    if width <= 0:
+        return ""
+    return text if text_width(text) <= width else slice_cells(text, width - 1) + "\u2026"
+
+
+def fit_cell(text, width, right=False):
+    text = clip(text, width)
+    padding = " " * max(0, width - text_width(text))
+    return padding + text if right else text + padding
+
+
+def pad_line(text, width):
+    text = slice_cells(text, width)
+    return text + " " * max(0, width - text_width(text))
+
+
+COLS = {"status": 2, "started": 16, "rt": 9, "quiet": 8, "id": 8, "type": 15, "mode": 4, "tools": 13, "model": 16,
         "tok": 12, "aiu": 7}
+COLUMN_LABELS = {"status": "S", "started": "STARTED (local)", "rt": "RUNTIME", "quiet": "QUIET",
+                 "id": "AGENT", "type": "TYPE", "mode": "MOD", "model": "MODEL", "tools": "TOOLS",
+                 "tok": "TOKENS", "aiu": "AIC"}
+RIGHT_ALIGNED = {"rt", "quiet", "tok", "aiu"}
 WIDE_AT = 132                                       # show TOKENS/AIC columns from here
 MODEL_AT = 160
 
 
-def table_header(width):
-    c = COLS
-    head = (f"{'S':<2} {'STARTED (local)':<{c['started']}} {'RUNTIME':>{c['rt']}} "
-            f"{'QUIET':>{c['quiet']}} {'AGENT':<{c['id']}} "
-            f"{'TYPE':<{c['type']}} {'MOD':<{c['mode']}} ")
+def table_columns(width):
+    columns = ["status", "started", "rt", "quiet", "id", "type", "mode"]
     if width >= MODEL_AT:
-        head += f"{'MODEL':<{c['model']}} "
-    head += f"{'TOOLS':<{c['tools']}} "
+        columns.append("model")
+    columns.append("tools")
     if width >= WIDE_AT:
-        head += f"{'TOKENS':<{c['tok']}} {'AIC':>{c['aiu']}} "
-    return (head + "TASK")[:max(0, width - 1)]
+        columns.extend(("tok", "aiu"))
+    for optional in ("tools", "mode", "quiet", "type", "id", "rt", "started"):
+        if sum(COLS[key] + 2 for key in columns) <= max(0, width - 1 - 16):
+            break
+        if optional in columns:
+            columns.remove(optional)
+    return columns
+
+
+def format_columns(values, width):
+    return "  ".join(fit_cell(values.get(key, ""), COLS[key], key in RIGHT_ALIGNED)
+                     for key in table_columns(width)) + "  "
+
+
+def table_header(width):
+    return slice_cells(format_columns(COLUMN_LABELS, width) + "TASK", max(0, width - 1))
 
 
 def agent_line(a, now, width, prefix=""):
-    c = COLS
     status = a.display_status
     quiet = fmt_dur(now - (a.last_event or now)) if a.ended is None else "-"
     mode = "bg" if a.mode == "background" else "sync"
-    text = (
-        f"{STATUS_GLYPH.get(status, '?'):<2} {fmt_timestamp(a.started):<{c['started']}} "
-        f"{fmt_dur(a.runtime(now)):>{c['rt']}} {quiet:>{c['quiet']}} "
-        f"{a.short_id:<{c['id']}} {clip(a.agent_type or '-', c['type']):<{c['type']}} "
-        f"{mode:<{c['mode']}} "
-    )
-    if width >= MODEL_AT:
-        text += f"{clip(a.model, c['model']):<{c['model']}} "
-    text += f"{clip(a.tool_summary, c['tools']):<{c['tools']}} "
-    if width >= WIDE_AT:
-        if a.total_tokens is not None:
-            tok = f"sum {fmt_tokens(a.total_tokens) if a.total_tokens else '0'}"
-        else:
-            tok = f"{a.in_tokens}/{a.out_tokens}" if a.tokens_known else ""
-            if a.in_tokens or a.out_tokens:
-                tok = f"{fmt_tokens(a.in_tokens)}/{fmt_tokens(a.out_tokens)}"
-        text += f"{tok:<{c['tok']}} {fmt_aic(a.aic):>{c['aiu']}} "
-    available = max(0, width - 1 - len(text))
-    prefix = prefix[:available]
-    task_w = max(0, available - len(prefix))
+    if a.total_tokens is not None:
+        tok = f"sum {fmt_tokens(a.total_tokens) if a.total_tokens else '0'}"
+    else:
+        tok = f"{a.in_tokens}/{a.out_tokens}" if a.tokens_known else ""
+        if a.in_tokens or a.out_tokens:
+            tok = f"{fmt_tokens(a.in_tokens)}/{fmt_tokens(a.out_tokens)}"
+    values = {"status": STATUS_GLYPH.get(status, "?"), "started": fmt_timestamp(a.started),
+              "rt": fmt_dur(a.runtime(now)), "quiet": quiet, "id": a.short_id,
+              "type": a.agent_type, "mode": mode, "model": a.model, "tools": a.tool_summary,
+              "tok": tok, "aiu": fmt_aic(a.aic)}
+    text = format_columns(values, width)
+    available = max(0, width - 1 - text_width(text))
+    prefix = slice_cells(prefix, available)
+    task_w = max(0, available - text_width(prefix))
     label = ("[approval] " if status == "waiting" else "") + a.label
-    return status, (text + prefix + clip(label, task_w))[:max(0, width - 1)]
+    return status, slice_cells(text + prefix + clip(label, task_w), max(0, width - 1))
 
 
 def build_rows(mon: Monitor, rows, now, width):
@@ -1592,22 +1638,34 @@ def build_rows(mon: Monitor, rows, now, width):
 def session_header(mon: Monitor, sid, kids, now, collapsed, width):
     st = mon.sessions.get(sid, {})
     live = [k for k in kids if k.ended is None]
-    run = sum(1 for k in live if k.display_status == "running")
     mark = "\u25bc" if sid not in collapsed else "\u25b6"
     turn = ""
     if st.get("turn_started"):
         end = st.get("turn_done") or now
-        turn = f"  turn {fmt_dur(end - st['turn_started'])}"
+        turn = f"turn {fmt_dur(end - st['turn_started'])}"
     aiu = ""
     if st.get("session_aiu_known") or st.get("session_aiu"):
-        aiu = f"  \u00b7 AIC {fmt_aic(st.get('session_aiu', 0))} session"
+        aiu = f"{fmt_aic(st.get('session_aiu', 0))} AIC"
     source = SOURCE_GLYPH.get(st.get("source", "vscode"), "?")
-    head = (f"{mark} {source} {mon.session_label(sid)} [{sid[:8]}]"
-            f" {session_status(st) if st else 'unknown'} {st.get('model') or ''}"
-            f"  \u00b7 {clip(st.get('activity') or st.get('title') or 'idle', 50)}"
-            f"  \u00b7 {len(kids)} agents ({len(live)} live, {run} running)"
-            f"  \u00b7 {sum(st.get('tools', {}).values())} tools{turn}{aiu}")
-    return clip(head, width - 1)
+    name_width = 36 if width >= 180 else (28 if width >= 132 else (24 if width >= 100 else 18))
+    name_width = min(name_width, max(4, width - 26))
+    parts = [f"{mark} {fit_cell(source, 2)} {fit_cell(mon.session_label(sid), name_width)} [{fit_cell(sid[:8], 8)}]"]
+    if width >= 60:
+        parts.append(fit_cell(session_status(st) if st else "unknown", 9))
+    if width >= 132:
+        parts.append(fit_cell(st.get("model") or "", 16))
+    if width >= 100:
+        parts.append(fit_cell(f"{len(live)}/{len(kids)} agents", 14, right=True))
+    if width >= 120:
+        parts.append(fit_cell(aiu, 12, right=True))
+    if width >= 160:
+        parts.append(fit_cell(f"{sum(st.get('tools', {}).values())} tools", 11, right=True))
+    if width >= 200:
+        parts.append(fit_cell(turn, 14, right=True))
+    head = "  ".join(parts) + "  "
+    activity = st.get("activity") or st.get("title") or ""
+    head += clip(activity, max(0, width - 1 - text_width(head)))
+    return slice_cells(head, max(0, width - 1))
 
 
 def usage_lines(mon: Monitor, width, sessions=None):
@@ -1693,12 +1751,22 @@ def build_display(mon: Monitor, rows, now, width, tree, collapsed, sessions=None
 def header_parts(text, notice, width):
     available = max(0, width - 1)
     right = clip(notice, available)
-    left_width = max(0, available - len(right) - (1 if right else 0))
-    return clip(text, left_width).ljust(available - len(right)), right
+    left_width = max(0, available - text_width(right) - (1 if right else 0))
+    return pad_line(clip(text, left_width), available - text_width(right)), right
 
 
 def filter_hint(show_done, activity):
     return f" d finished:{'show' if show_done else 'hide'}  a activity:{ACTIVITY_FILTERS[activity]} "
+
+
+def table_row_style(kind, status, selected, use_color):
+    import curses
+    if selected:
+        return (curses.color_pair(6) if use_color else curses.A_REVERSE) | curses.A_BOLD
+    if kind == "session":
+        return (curses.color_pair(3) if use_color else 0) | curses.A_BOLD | curses.A_UNDERLINE
+    pairs = {"running": 1, "starting": 2, "idle": 3, "done": 4, "failed": 5, "cancelled": 2, "waiting": 2}
+    return curses.color_pair(pairs.get(status, 0)) if use_color else 0
 
 
 def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done=False,
@@ -1728,7 +1796,6 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
             curses.init_pair(4, curses.COLOR_BLUE, -1)
             curses.init_pair(5, curses.COLOR_RED, -1)
             curses.init_pair(6, curses.COLOR_BLACK, curses.COLOR_WHITE)
-        pairs = {"running": 1, "starting": 2, "idle": 3, "done": 4, "failed": 5, "cancelled": 2, "waiting": 2}
 
         show_done = all_done
         current_sort = sort_key
@@ -1775,7 +1842,7 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                                curses.color_pair(6) if use_color else curses.A_REVERSE)
                 color = {"available": 2, "error": 5, "current": 1,
                          "diverged": 2, "restart": 2}.get(notice.status, 6)
-                stdscr.addnstr(0, len(left), right, len(right),
+                stdscr.addnstr(0, text_width(left), right, len(right),
                                (curses.color_pair(color) if use_color else curses.A_REVERSE) | curses.A_BOLD)
             except curses.error:
                 pass
@@ -1811,7 +1878,8 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
             else:
                 header, body = build_display(mon, rows, now, width, tree_mode, collapsed, sessions)
                 try:
-                    stdscr.addnstr(1, 0, header.ljust(width), width, curses.A_BOLD)
+                    header = pad_line(header, width - 1)
+                    stdscr.addnstr(1, 0, header, len(header), curses.A_BOLD)
                 except curses.error:
                     pass
                 foot = footer_lines(mon, width, sessions)
@@ -1825,15 +1893,10 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                     scroll = cursor
                 for i, item in enumerate(body[scroll:scroll + avail]):
                     kind, _obj, status, text = item
-                    if kind == "session":
-                        attr = (curses.color_pair(6) if use_color else 0) | curses.A_BOLD
-                    else:
-                        attr = curses.color_pair(pairs.get(status, 0)) if use_color else 0
-                    if scroll + i == cursor:
-                        attr |= curses.A_REVERSE | curses.A_BOLD
-                        text = text.ljust(width - 1)
+                    attr = table_row_style(kind, status, scroll + i == cursor, use_color)
+                    text = pad_line(text, width - 1)
                     try:
-                        stdscr.addnstr(top + i, 0, text, width - 1, attr)
+                        stdscr.addnstr(top + i, 0, text, len(text), attr)
                     except curses.error:
                         pass
                 if not body:

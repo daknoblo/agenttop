@@ -248,6 +248,15 @@ The `r` key refreshes logs only and does not trigger extra update checks.
 
 ### Columns
 
+Session group headers use aligned fields rather than variable-length highlighted
+text. Unselected groups are cyan and underlined across the row; only the selected
+session or agent gets the full-width selection background. Agent columns have
+two-cell gaps, clipped field widths and right-aligned numeric values.
+
+On narrow terminals, lower-priority columns are hidden to keep task descriptions
+visible. Widen the terminal or open agent details to see omitted fields.
+Session counts use `live/total agents` for the currently displayed group.
+
 | Column | Meaning |
 | --- | --- |
 | `S` | status: `⏸` awaiting approval, `●` running, `○` starting, `◌` idle, `✓` done, `✗` failed, `⊘` cancelled, `?` unknown |

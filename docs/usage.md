@@ -33,13 +33,25 @@ reading session logs. See [updating](installation.md#updating).
   number of input logs, sort order and display mode. The top-right corner shows
   update availability independently of the left-hand statistics.
 - **Session rows:** data source, project/directory label, shortened session ID,
-  recorded status, model, activity/title and available usage.
+  recorded status, model, live/total agent counts, available usage and activity.
+  These occupy aligned fields, so longer project names do not shift the following
+  information. Full values remain available in JSON.
 - **Agent rows:** recorded lifecycle state, local start date/time, runtime,
   quiet time, shortened ID, agent type, execution mode and tool activity.
 - **Wide terminals:** token and AIC columns appear at 132 columns or more;
   the current model column appears at 160 columns.
 - **Footer:** usage for up to three matching sessions with usage data, plus
   read/parse warnings and update-check details when present.
+
+Unselected session headers use a subtle cyan underline instead of bright bars
+of different lengths. The selected row has the same full-width highlight whether
+it is a session or an agent. In monochrome terminals, selection uses reverse video.
+Numeric columns are right-aligned and separated from neighboring fields.
+
+As the terminal narrows, lower-priority columns disappear to preserve room for
+the task description. Widen the terminal or open details to see hidden values.
+Clipping and padding account for common wide characters and combining accents;
+complex emoji rendering can still vary with the terminal and font.
 
 When the header says `Update: agenttop -update`, quit with `q`, run
 `agenttop -update`, then start the monitor again. `Up to date` refers to the
@@ -150,8 +162,8 @@ The `STARTED (local)` column shows `YYYY-MM-DD HH:MM` in the monitor's local
 timezone, including the date for agents that have been running across days.
 Open agent details with Enter for seconds and an explicit UTC offset; the
 completion timestamp there also includes its full date. Text snapshots and
-both tree/flat views use the same start column. On narrow terminals, later
-columns are clipped so rows do not wrap.
+both tree/flat views use the same start column. On narrow terminals, optional
+columns are hidden and remaining fields clipped so rows do not wrap.
 
 This timestamp is the first observed delegation/start, not an OS process
 creation measurement. A resumed agent keeps its original start. If the log
