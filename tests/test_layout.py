@@ -47,20 +47,27 @@ class TableLayoutTests(unittest.TestCase):
                 offset = 0
                 widths = APP["column_widths"](width)
                 separator = APP["COLUMN_SEPARATOR"]
-                for key in APP["table_columns"](width):
+                columns = APP["table_columns"](width)
+                task_offset = None
+                for index, key in enumerate(columns):
                     cell = widths[key]
-                    self.assertEqual(row[offset + cell:offset + cell + len(separator)], separator)
+                    if index < len(columns) - 1:
+                        self.assertEqual(row[offset + cell:offset + cell + len(separator)], separator)
                     if key in APP["RIGHT_ALIGNED"]:
                         self.assertNotEqual(row[offset + cell - 1], " ")
-                    offset += cell + len(separator)
-                self.assertEqual(header.index("TASK"), offset)
-                self.assertEqual(row.index("TASK-MARKER"), offset)
+                    if key == "task":
+                        task_offset = offset
+                    offset += cell + (len(separator) if index < len(columns) - 1 else 0)
+                self.assertEqual(columns[:2], ["status", "task"])
+                self.assertEqual(header.index("TASK"), task_offset)
+                self.assertEqual(row.index("TASK-MARKER"), task_offset)
+                self.assertEqual(offset, width - 1)
                 self.assertLessEqual(len(row), width - 1)
 
     def test_narrow_tables_reserve_room_for_task(self):
         for width in (60, 80, 100, 120, 132, 160):
             with self.subTest(width=width):
-                self.assertGreaterEqual(width - 1 - APP["table_header"](width).index("TASK"), 16)
+                self.assertGreaterEqual(APP["column_widths"](width)["task"], 16)
                 self.assertIn("TASK-MARKER", APP["agent_line"](self.agents[0], self.now, width)[1])
         self.assertNotIn("tools", APP["table_columns"](80))
         self.assertIn("model", APP["table_columns"](160))
@@ -128,11 +135,51 @@ class TableLayoutTests(unittest.TestCase):
     def test_session_fields_align_despite_label_and_value_lengths(self):
         first = APP["session_header"](self.mon, "aaaaaaaa", [self.agents[0]], self.now, set(), 240)
         second = APP["session_header"](self.mon, "bbbbbbbb", self.agents * 5, self.now, set(), 240)
-        for marker in ("[", "running", "example-model", " agents", " AIC", " tools", "turn", "Synthetic"):
+        for marker in ("[", " AIC"):
             self.assertEqual(first.index(marker), second.index(marker), marker)
-        self.assertIn("\u2026", second)
-        self.assertIn("1/1 agents", first)
-        self.assertIn("10/10 agents", second)
+        self.assertEqual([len(cell) for cell in first.split(APP["COLUMN_SEPARATOR"])],
+                         [len(cell) for cell in second.split(APP["COLUMN_SEPARATOR"])])
+        self.assertIn("1 active", first)
+        self.assertIn("10 active", second)
+        for header in (first, second):
+            for removed in ("example-model", " tools", "turn", "Synthetic activity"):
+                self.assertNotIn(removed, header)
+
+    def test_task_tree_and_unicode_do_not_shift_following_metadata(self):
+        agent = self.agents[0]
+        agent.description = "\u7814\u7a76e\u0301 task with a longer description"
+        prefix = "   \u2502  \u2514\u2500 "
+        for width in (120, 132, 160, 240):
+            header = APP["table_header"](width)
+            row = APP["agent_line"](agent, self.now, width, prefix)[1]
+            self.assertIn(prefix, row)
+            started = APP["fmt_timestamp"](agent.started)
+            self.assertEqual(APP["text_width"](row[:row.index(started)]), header.index("STARTED (local)"))
+            self.assertEqual(APP["text_width"](row), width - 1)
+
+    def test_reduced_session_header_keeps_attention_and_empty_session_state(self):
+        state = self.mon.sessions["aaaaaaaa"]
+        state["inputs"]["request"] = {"started": self.now}
+        header = APP["session_header"](self.mon, "aaaaaaaa", [], self.now, set(), 120)
+        self.assertIn("INPUT", header)
+        self.assertIn("AIC", header)
+        state["inputs"].clear()
+        state["status"] = "idle"
+        header = APP["session_header"](self.mon, "aaaaaaaa", [], self.now, set(), 120)
+        self.assertIn("idle", header)
+        self.assertNotIn("0/0", header)
+        for width in (0, 1, 20, 40, 60, 80, 120, 200):
+            header = APP["session_header"](self.mon, "aaaaaaaa", self.agents, self.now, set(), width)
+            self.assertLessEqual(APP["text_width"](header), max(0, width - 1))
+
+    def test_session_summary_counts_active_idle_and_finished_agents(self):
+        self.agents[1].status = "idle"
+        done = APP["Agent"]("finished", "aaaaaaaa", self.now)
+        done.finish(self.now, "cancelled")
+        header = APP["session_header"](self.mon, "aaaaaaaa", [*self.agents, done], self.now, set(), 200)
+        self.assertIn("1 active", header)
+        self.assertIn("1 idle", header)
+        self.assertIn("1 finished", header)
 
     def test_selection_style_is_consistent_for_sessions_and_agents(self):
         import curses

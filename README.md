@@ -14,11 +14,11 @@ and usage figures (not a captured session):
 
 ```text
  agenttop r42.0123abcd | AIC total 12  12:00:00  running 1  starting 0  idle 1  done 1  waiting 0 | sessions 1  logs 1  sort:runtime  tree activity:all +finished
-S  │ STARTED (local)  │    RUNTIME │     QUIET │ AGENT    │ TYPE               │ EXEC       │ MODEL                        │ TOOLS                │         TOKENS │        AIC │ TASK
-▼ >_ example-app@main                     [aaaaaaaa]  running    model: example-model                    2/3 agents     12.00 AIC      0 tools     turn 2m 00s  Update example documentation
-●  │ 2026-01-01 11:58 │     2m 00s │        3s │ 11111111 │ general-purpose    │ background │ example-model                │ 3 · view             │         12k/1k │       1.00 │ ├─ Update example documentation
-◌  │ 2026-01-01 11:58 │     1m 30s │        3s │ 22222222 │ explore            │ background │                              │ 3 · glob             │                │     0.5000 │ ├─ Find example files
-✓  │ 2026-01-01 11:59 │        45s │         - │ 33333333 │ code-review        │ sync       │ example-model                │ 3 · view             │         sum 9k │     0.5000 │ └─ Review example tests
+S  │ TASK                                      │ STARTED (local)  │    RUNTIME │     QUIET │ AGENT    │ TYPE               │ EXEC       │ MODEL                        │ TOOLS                │         TOKENS │        AIC
+▼ >_ example-app@main [aaaaaaaa] │ 1 active · 1 idle · 1 finished │ AIC 12.00
+●  │ ├─ Update example documentation           │ 2026-01-01 11:58 │     2m 00s │        3s │ 11111111 │ general-purpose    │ background │ example-model                │ 3 · view             │         12k/1k │       1.00
+◌  │ ├─ Find example files                     │ 2026-01-01 11:58 │     1m 30s │        3s │ 22222222 │ explore            │ background │                              │ 3 · glob             │                │     0.5000
+✓  │ └─ Review example tests                   │ 2026-01-01 11:59 │        45s │         - │ 33333333 │ code-review        │ sync       │ example-model                │ 3 · view             │         sum 9k │     0.5000
 
 aaaaaaaa example-model ctx 16k/128k (8k cached) turn 32k in / 4k out AIC turn 4.00 (self 2.00 + agents 2.00) AIC session 12
  q quit  d finished:show  a activity:all  t tree  s sort  f focus  / search  ? help
@@ -253,6 +253,8 @@ Session group headers use aligned fields rather than variable-length highlighted
 text. Unselected groups are cyan and underlined across the row; only the selected
 session or agent gets the full-width selection background. Agent columns have
 visible vertical separators, clipped field widths and right-aligned numeric values.
+The task and its delegation tree come immediately after the status on the left;
+the remaining agent columns retain their existing order and information.
 Empty cells retain their separators, so values in adjacent rows remain clearly
 assigned to their columns. At 200 columns and wider, model names get 28 cells,
 tool summaries 20 cells and execution mode 10 cells.
@@ -261,11 +263,17 @@ selection color; approval-waiting groups use yellow instead of cyan.
 
 On narrow terminals, lower-priority columns are hidden to keep task descriptions
 visible. Widen the terminal or open agent details to see omitted fields.
-Session counts use `live/total agents` for the currently displayed group.
+Session heads contain project/branch identity (with a short ID when space permits),
+a compact summary of the displayed agents and the session AIC total. `active`
+counts running/starting agents; idle, finished and attention states are shown
+when present. With no displayed agents, the session's own status is shown instead.
+Repeated models, tool counts, turn duration and activity prose are omitted from
+the group heading; they remain available in the agent rows/details or JSON.
 
 | Column | Meaning |
 | --- | --- |
 | `S` | status: `⌨` awaiting an answer, `⏸` awaiting approval, `●` running, `○` starting, `◌` idle, `✓` done, `✗` failed, `⊘` cancelled, `?` unknown |
+| `TASK` | task description and nested delegation tree, immediately after status |
 | `STARTED (local)` | first observed delegation/start time as `YYYY-MM-DD HH:MM` in your local timezone; details include seconds and UTC offset |
 | `RUNTIME` | wall clock since the agent was delegated |
 | `QUIET` | time since the last event for this agent — how long you have been waiting |

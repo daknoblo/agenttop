@@ -1748,22 +1748,17 @@ COLS = {"status": 2, "started": 16, "rt": 9, "quiet": 8, "id": 8, "type": 15, "m
         "tok": 12, "aiu": 7}
 COLUMN_LABELS = {"status": "S", "started": "STARTED (local)", "rt": "RUNTIME", "quiet": "QUIET",
                  "id": "AGENT", "type": "TYPE", "mode": "EXEC", "model": "MODEL", "tools": "TOOLS",
-                 "tok": "TOKENS", "aiu": "AIC"}
+                 "tok": "TOKENS", "aiu": "AIC", "task": "TASK"}
 RIGHT_ALIGNED = {"rt", "quiet", "tok", "aiu"}
 COLUMN_SEPARATOR = " \u2502 "
 WIDE_AT = 132                                       # show TOKENS/AIC columns from here
 MODEL_AT = 160
 
 
-def column_widths(width):
+def table_layout(width):
     widths = dict(COLS)
     if width >= 200:
         widths.update(rt=10, quiet=9, type=18, mode=10, model=28, tools=20, tok=14, aiu=10)
-    return widths
-
-
-def table_columns(width):
-    widths = column_widths(width)
     columns = ["status", "started", "rt", "quiet", "id", "type", "mode"]
     if width >= MODEL_AT:
         columns.append("model")
@@ -1775,17 +1770,33 @@ def table_columns(width):
             break
         if optional in columns:
             columns.remove(optional)
-    return columns
+    widths["task"] = max(0, width - 1 - sum(widths[key] + len(COLUMN_SEPARATOR) for key in columns))
+    return [columns[0], "task", *columns[1:]], widths
 
 
-def format_columns(values, width):
-    widths = column_widths(width)
-    return COLUMN_SEPARATOR.join(fit_cell(values.get(key, ""), widths[key], key in RIGHT_ALIGNED)
-                                 for key in table_columns(width)) + COLUMN_SEPARATOR
+def column_widths(width):
+    return table_layout(width)[1]
+
+
+def table_columns(width):
+    return table_layout(width)[0]
+
+
+def format_columns(values, width, task_prefix=""):
+    columns, widths = table_layout(width)
+    cells = []
+    for key in columns:
+        if key == "task":
+            prefix = slice_cells(task_prefix, widths[key])
+            task = prefix + clip(values.get(key, ""), max(0, widths[key] - text_width(prefix)))
+            cells.append(pad_line(task, widths[key]))
+        else:
+            cells.append(fit_cell(values.get(key, ""), widths[key], key in RIGHT_ALIGNED))
+    return COLUMN_SEPARATOR.join(cells)
 
 
 def table_header(width):
-    return slice_cells(format_columns(COLUMN_LABELS, width) + "TASK", max(0, width - 1))
+    return slice_cells(format_columns(COLUMN_LABELS, width), max(0, width - 1))
 
 
 def agent_line(a, now, width, prefix=""):
@@ -1802,12 +1813,8 @@ def agent_line(a, now, width, prefix=""):
               "rt": fmt_dur(a.runtime(now)), "quiet": quiet, "id": a.short_id,
               "type": a.agent_type, "mode": mode, "model": a.model, "tools": a.tool_summary,
               "tok": tok, "aiu": fmt_aic(a.aic)}
-    text = format_columns(values, width)
-    available = max(0, width - 1 - text_width(text))
-    prefix = slice_cells(prefix, available)
-    task_w = max(0, available - text_width(prefix))
-    label = ({"waiting": "[approval] ", "input": "[INPUT] "}.get(status, "")) + a.label
-    return status, slice_cells(text + prefix + clip(label, task_w), max(0, width - 1))
+    values["task"] = ({"waiting": "[approval] ", "input": "[INPUT] "}.get(status, "")) + a.label
+    return status, slice_cells(format_columns(values, width, prefix), max(0, width - 1))
 
 
 def build_rows(mon: Monitor, rows, now, width):
@@ -1817,41 +1824,48 @@ def build_rows(mon: Monitor, rows, now, width):
 
 def session_header(mon: Monitor, sid, kids, now, collapsed, width):
     st = mon.sessions.get(sid, {})
-    live = [k for k in kids if k.ended is None]
     mark = "\u25bc" if sid not in collapsed else "\u25b6"
-    turn = ""
-    if st.get("turn_started"):
-        end = st.get("turn_done") or now
-        turn = f"turn {fmt_dur(end - st['turn_started'])}"
-    aiu = ""
-    if st.get("session_aiu_known") or st.get("session_aiu"):
-        aiu = f"{fmt_aic(st.get('session_aiu', 0))} AIC"
+    status = session_status(st) if st else "unknown"
+    counts = collections.Counter(k.display_status for k in kids if k.ended is None)
+    inputs = counts["input"] + (status == "input")
+    approvals = counts["waiting"] + (status == "waiting")
+    summary = []
+    if inputs:
+        summary.append(f"{inputs} INPUT")
+    if approvals:
+        summary.append(f"{approvals} approval")
+    if kids:
+        summary.append(f"{counts['running'] + counts['starting']} active")
+        if counts["idle"]:
+            summary.append(f"{counts['idle']} idle")
+        finished = sum(k.ended is not None for k in kids)
+        if finished:
+            summary.append(f"{finished} finished")
+        unknown = sum(value for key, value in counts.items()
+                      if key not in ("running", "starting", "idle", "input", "waiting"))
+        if unknown:
+            summary.append(f"{unknown} unknown")
+    elif not summary:
+        summary.append(status)
+
+    available = max(0, width - 1)
+    cost_width = 14 if width >= 200 else (12 if width >= 80 else 0)
+    space = max(0, available - cost_width - len(COLUMN_SEPARATOR) * (2 if cost_width else 1))
+    identity_min = 44 if width >= 120 else 32
+    summary_min = min(12, max(0, space - 5))
+    identity_width = min(max(identity_min, column_widths(width)["task"] + 5),
+                         max(0, space - summary_min))
+    summary_width = max(0, space - identity_width)
     source = SOURCE_GLYPH.get(st.get("source", "vscode"), "?")
-    name_width = 36 if width >= 180 else (28 if width >= 132 else (24 if width >= 100 else 18))
-    name_width = min(name_width, max(4, width - 26))
-    parts = [f"{mark} {fit_cell(source, 2)} {fit_cell(mon.session_label(sid), name_width)} [{fit_cell(sid[:8], 8)}]"]
-    if width >= 60:
-        status = session_status(st) if st else "unknown"
-        parts.append(fit_cell("INPUT" if status == "input" else status, 9))
-    if width >= 132:
-        model = f"model: {st['model']}" if st.get("model") else ""
-        parts.append(fit_cell(model, 34 if width >= 200 else 24))
-    if width >= 100:
-        parts.append(fit_cell(f"{len(live)}/{len(kids)} agents", 14, right=True))
-    if width >= 120:
-        parts.append(fit_cell(aiu, 12, right=True))
-    if width >= 160:
-        parts.append(fit_cell(f"{sum(st.get('tools', {}).values())} tools", 11, right=True))
-    if width >= 200:
-        parts.append(fit_cell(turn, 14, right=True))
-    head = "  ".join(parts) + "  "
-    activity = st.get("activity") or st.get("title") or ""
-    if st and session_status(st) == "input":
-        activity = "INPUT: answer needed"
-    elif any(k.display_status == "input" for k in kids):
-        activity = "INPUT: agent needs answer"
-    head += clip(activity, max(0, width - 1 - text_width(head)))
-    return slice_cells(head, max(0, width - 1))
+    short_id = f" [{fit_cell(sid[:8], 8)}]" if identity_width >= 28 else ""
+    name_width = max(0, identity_width - 5 - text_width(short_id))
+    identity = f"{mark} {fit_cell(source, 2)} {fit_cell(mon.session_label(sid), name_width)}{short_id}"
+    parts = [pad_line(identity, identity_width), fit_cell(" \u00b7 ".join(summary), summary_width)]
+    if cost_width:
+        cost = ("AIC " + fit_cell(fmt_aic(st.get("session_aiu", 0)), cost_width - 4, right=True)
+                if st.get("session_aiu_known") or st.get("session_aiu") else " " * cost_width)
+        parts.append(cost)
+    return slice_cells(COLUMN_SEPARATOR.join(parts), available)
 
 
 def usage_lines(mon: Monitor, width, sessions=None):

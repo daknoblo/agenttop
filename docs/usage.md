@@ -32,12 +32,14 @@ reading session logs. See [updating](installation.md#updating).
 - **Header:** local program version, total known AIC, visible agent counts, session count,
   number of input logs, sort order and display mode. The top-right corner shows
   update availability independently of the left-hand statistics.
-- **Session rows:** data source, project/directory label, shortened session ID,
-  recorded status, model, live/total agent counts, available usage and activity.
-  These occupy aligned fields, so longer project names do not shift the following
-  information. Full values remain available in JSON.
-- **Agent rows:** recorded lifecycle state, local start date/time, runtime,
-  quiet time, shortened ID, agent type, execution mode and tool activity.
+- **Session rows:** project/branch, source symbol, short session ID where space
+  permits, a compact activity summary and session AIC. Models, tool totals,
+  turn duration and long activity descriptions are no longer repeated here.
+  The summary counts displayed agents (active = running/starting); with no
+  displayed agents it shows the session's own status. Full metadata remains in JSON.
+- **Agent rows:** status, then the **task on the left**, including its nested
+  delegation tree; followed by local start time, runtime, quiet time, ID, type,
+  execution mode, model and metrics as space permits.
 - **Wide terminals:** token and AIC columns appear at 132 columns or more;
   the current model column appears at 160 columns.
 - **Footer:** usage for up to three matching sessions with usage data, plus
@@ -62,8 +64,8 @@ complex emoji rendering can still vary with the terminal and font.
 `EXEC` (formerly `MOD`) is the execution mode: `background` or, in compact
 layouts, `bg` means the caller can continue while the agent runs; `sync` means
 the caller waits for its result. `MODEL` is the language model used by that
-agent. These are independent properties. Session summaries explicitly prefix
-their model with `model:` to distinguish them from the execution-mode column.
+agent. These are independent properties. Session summaries no longer repeat
+the model; it remains in the agent table and detail view.
 The JSON `mode` and `model` fields are unchanged.
 
 When the header says `Update: agenttop -update`, quit with `q`, run
