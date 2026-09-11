@@ -72,6 +72,14 @@ class MainAgentTests(unittest.TestCase):
         self.assertEqual(mains[0].source, "vscode")
         self.assertIn("Inspecting example files", mains[0].label)
 
+    def test_vsc_tool_start_recovers_main_activity_after_missing_turn_start(self):
+        self.ahp("chat/toolCallStart", {"toolCallId": "read", "toolName": "view"})
+        _, mains, _ = self.views()
+        self.assertEqual(len(mains), 1)
+        self.assertEqual(mains[0].display_status, "running")
+        self.assertEqual(mains[0].label, "Main: view")
+        self.assertIsNone(mains[0].started)
+
     def test_metadata_only_does_not_invent_a_main_agent(self):
         self.mon.state_for(self.sid, self.now)["repo"] = "example/project"
         self.assertEqual(self.views("all")[1], [])

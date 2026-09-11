@@ -1357,6 +1357,7 @@ class Monitor:
             if action.get("toolName"):
                 state["tools"][action["toolName"]] += 1
                 state["activity"] = action["toolName"]
+                state["status"] = "running"
             self.on_start(sess, action, ts)
             if action.get("toolCallId"):
                 self.input_tool_started(sess, action.get("toolName"), f"{sess}/{action['toolCallId']}", ts)
