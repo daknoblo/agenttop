@@ -461,7 +461,7 @@ class Agent:
         "configuration", "model_changes", "completion", "usage_totals", "final_aiu", "aiu_known",
         "pending_tools", "completed_tools", "tool_results", "tool_durations", "tool_samples",
         "recent_results", "last_error", "permissions", "permission_results", "permission_wait", "tool_max",
-        "last_permission", "tokens_known", "native_terminal", "inputs",
+        "last_permission", "tokens_known", "native_terminal", "inputs", "stream_error",
     )
 
     def __init__(self, call_id, session, started, parent=None):
@@ -514,6 +514,7 @@ class Agent:
         self.last_permission = ""
         self.native_terminal = False
         self.inputs = {}
+        self.stream_error = None
 
     @property
     def display_status(self):
@@ -524,6 +525,10 @@ class Agent:
     def is_unconfirmed(self, now):
         return (self.ended is None and self.display_status in ("running", "starting")
                 and not event_within(self.last_event, now, ACTIVE_ACTIVITY_SECONDS))
+
+    @property
+    def has_stream_problem(self):
+        return self.stream_error is not None and self.ended is None and self.display_status in ("running", "starting")
 
     @property
     def aic(self):
@@ -753,6 +758,9 @@ class Monitor:
         self.pending_configuration = {}
         self.input_requests = {}
         self.input_aliases = {}
+        self.pending_subscriptions = {}
+        self.stream_errors = {}
+        self.stream_event_at = {}
         self.sessions: dict[str, dict] = {}
         self.files: list[str] = []
         self.errors: list[str] = []
@@ -832,7 +840,7 @@ class Monitor:
                                 break
                             self.feed_cli(text, self.cli_files[path])
                         else:
-                            self.feed(text)
+                            self.feed(text, source=path)
             except OSError as exc:
                 self.errors.append(f"{os.path.basename(path)}: {exc}")
                 continue
@@ -912,6 +920,7 @@ class Monitor:
             self.start_input(sess, f"tool:{call}", owner, ts, "ask_user", call)
 
     def adopt_inputs(self, agent):
+        agent.stream_error = self.stream_errors.get((agent.session, agent.call_id.rsplit("/", 1)[-1]))
         for (sess, key), (previous, info) in list(self.input_requests.items()):
             if (sess == agent.session and previous is not None and previous is not agent
                     and previous.call_id.rsplit("/", 1)[-1] == agent.call_id.rsplit("/", 1)[-1]
@@ -922,9 +931,59 @@ class Monitor:
 
     def agent_for_chat(self, chat, sess=None):
         raw_call = chat.rsplit("/", 1)[-1]
+        if sess is None:
+            parent = session_of(chat.rsplit("/", 1)[0])
+            if parent in self.sessions:
+                sess = parent
         candidates = [a for a in self.agents.values()
                       if a.call_id.rsplit("/", 1)[-1] == raw_call and (sess is None or a.session == sess)]
         return candidates[0] if len(candidates) == 1 else None
+
+    def record_stream_state(self, channel, error, ts):
+        agent = self.agent_for_chat(channel)
+        parent = agent.session if agent else session_of(channel.rsplit("/", 1)[0])
+        if parent not in self.sessions:
+            return
+        key = (parent, channel.rsplit("/", 1)[-1])
+        if ts < self.stream_event_at.get(key, float("-inf")):
+            return
+        self.stream_event_at[key] = ts
+        if error is not None:
+            code = error.get("code")
+            info = {"source": "vscode", "state": "unavailable", "at": ts,
+                    "message": ("Resource not found" if code == -32001
+                                and str(error.get("message", "")).lower().startswith("resource not found")
+                                else "Subagent subscription failed")}
+            if isinstance(code, int) and not isinstance(code, bool):
+                info["error_code"] = code
+            self.stream_errors[key] = info
+        else:
+            self.stream_errors.pop(key, None)
+        if agent:
+            agent.stream_error = self.stream_errors.get(key)
+
+    def on_subscription(self, event, ts, source=None):
+        log = event.get("_ahpLog") or {}
+        connection, request_id = log.get("connectionId"), event.get("id")
+        if (not isinstance(connection, str) or not isinstance(request_id, (str, int))
+                or isinstance(request_id, bool)):
+            return False
+        key = (source, connection, request_id)
+        params = event.get("params") or {}
+        if event.get("method") == "subscribe" and isinstance(params, dict):
+            channel = params.get("channel") or ""
+            if isinstance(channel, str) and channel.startswith("ahp-chat://subagent/"):
+                self.pending_subscriptions[key] = channel
+                return True
+        if event.get("method") is None and key in self.pending_subscriptions and ("error" in event or "result" in event):
+            channel = self.pending_subscriptions.pop(key)
+            error = event.get("error")
+            if error is not None and not isinstance(error, dict):
+                self.report_error("Invalid subagent subscription error")
+                return True
+            self.record_stream_state(channel, error, ts)
+            return True
+        return False
 
     def on_ahp_input(self, sess, kind, action, ts, owner=None):
         if kind in ("chat/inputCompleted", "session/inputNeededRemoved"):
@@ -1044,8 +1103,8 @@ class Monitor:
         state["last_event"] = max(state["last_event"], ts)
         aid = evt.get("agentId")
         owner = self.by_agent_id.get(aid) if isinstance(aid, str) else None
-        if owner is not None and owner.session != sess:
-            owner = None
+        if isinstance(aid, str) and (owner is None or owner.session != sess):
+            owner = next((a for a in self.agents.values() if a.agent_id == aid and a.session == sess), None)
         raw_call = data.get("toolCallId")
         call = f"{sess}/{raw_call}" if isinstance(raw_call, str) else None
         if kind == "tool.execution_complete":
@@ -1299,10 +1358,14 @@ class Monitor:
         if message not in self.errors and len(self.errors) < 50:
             self.errors.append(message)
 
-    def feed(self, line: str):
-        if any(tok in line for tok in SKIP_TOKENS):
+    def feed(self, line: str, source=None):
+        heartbeat = ("ahp-chat://subagent/" in line
+                     and any(token in line for token in ('"chat/delta"', '"chat/toolCallDelta"')))
+        rpc = ('"subscribe"' in line and "ahp-chat://subagent/" in line) or (
+            bool(self.pending_subscriptions) and '"id"' in line and ('"result"' in line or '"error"' in line))
+        if not heartbeat and not rpc and any(tok in line for tok in SKIP_TOKENS):
             return
-        if not any(tok in line for tok in KEEP_TOKENS):
+        if not heartbeat and not rpc and not any(tok in line for tok in KEEP_TOKENS):
             return
         try:
             evt = json.loads(line)
@@ -1311,14 +1374,19 @@ class Monitor:
             return
         if not isinstance(evt, dict):
             return
-        fingerprint = hashlib.blake2b(line.encode("utf-8"), digest_size=16).digest()
+        control = evt.get("method") == "subscribe" or (
+            evt.get("method") is None and ("result" in evt or "error" in evt))
+        fingerprint_text = f"{source}\0{line}" if control else line
+        fingerprint = hashlib.blake2b(fingerprint_text.encode("utf-8"), digest_size=16).digest()
         if fingerprint in self.seen_ahp:
             return
         self.seen_ahp.add(fingerprint)
+        ts = parse_ts((evt.get("_ahpLog") or {}).get("ts")) or time.time()
+        if self.on_subscription(evt, ts, source):
+            return
         params = evt.get("params")
         if not isinstance(params, dict):
             return
-        ts = parse_ts((evt.get("_ahpLog") or {}).get("ts")) or time.time()
 
         if evt.get("method") == "root/sessionSummaryChanged":
             sid = str(params.get("session") or "").rsplit("/", 1)[-1]
@@ -1332,6 +1400,15 @@ class Monitor:
         channel = params.get("channel") or ""
         kind = action.get("type")
 
+        if heartbeat and kind in ("chat/delta", "chat/toolCallDelta"):
+            if channel.startswith("ahp-chat://subagent/"):
+                agent = self.agent_for_chat(channel)
+                if agent:
+                    self.record_stream_state(channel, None, ts)
+                    completed_tool = kind == "chat/toolCallDelta" and action.get("toolCallId") in agent.completed_tools
+                    if agent.ended is None and not completed_tool and (agent.last_event is None or ts >= agent.last_event):
+                        agent.last_event = ts
+            return
         if channel.startswith("ahp-chat://subagent"):
             self.on_subagent_channel(channel, kind, action, ts)
             return
@@ -1464,6 +1541,7 @@ class Monitor:
         if agent is None:
             agent = Agent(call_id, sess, ts)
             self.agents[call_id] = agent
+        agent.stream_error = self.stream_errors.get((sess, call_id))
         agent.status = "starting"
         agent.last_event = ts
 
@@ -1586,6 +1664,9 @@ class Monitor:
 
     def on_subagent_channel(self, channel, kind, action, ts):
         call_id = channel.rsplit("/", 1)[-1]
+        agent = self.agent_for_chat(channel)
+        if agent and isinstance(kind, str):
+            self.record_stream_state(channel, None, ts)
         if kind in AHP_INPUT_EVENTS:
             owner = self.agent_for_chat(channel)
             if owner:
@@ -1597,10 +1678,14 @@ class Monitor:
             owner = self.agent_for_chat(channel)
             if owner:
                 self.clear_inputs(owner.session, owner, before=ts)
-        agent = self.agents.get(call_id)
+        if (agent is not None and agent.ended is None and kind in ("chat/turnStarted", "chat/toolCallStart")
+                and (agent.last_event is None or ts >= agent.last_event)
+                and (kind != "chat/toolCallStart" or action.get("toolCallId") not in agent.completed_tools)):
+            agent.start_work()
+            agent.last_event = ts
         if agent is None or agent.session in self.cli_sessions:
             return
-        agent.last_event = ts
+        agent.last_event = max(agent.last_event or ts, ts)
         if kind == "chat/toolCallStart":
             tool = action.get("toolName")
             if tool:
@@ -1743,7 +1828,7 @@ def expand_target_list(targets):
 STATUS_GLYPH = {"running": "\u25cf", "starting": "\u25cb", "idle": "\u25cc", "waiting": "\u23f8", "input": "\u2328",
                 "done": "\u2713", "failed": "\u2717", "cancelled": "\u2298", "orphan": "?", "unknown": "?"}
 STATUS_ORDER = {status: i for i, status in enumerate(("input", "waiting", "running", "starting", "idle", "failed", "cancelled", "done", "orphan"))}
-STATUS_LEGEND = " \u2328 input  \u23f8 approval  \u25cf running  \u25cb starting  ~ no recent signal  \u25cc idle  \u2713 done  \u2717 failed  \u2298 cancelled  ? unknown "
+STATUS_LEGEND = " \u2328 input  \u23f8 approval  ! VSC stream error  \u25cf running  \u25cb starting  ~ no recent signal  \u25cc idle  \u2713 done  \u2717 failed  \u2298 cancelled  ? unknown "
 SOURCE_LABELS = {"cli": "CLI", "vscode": "VSC"}
 
 
@@ -1922,6 +2007,7 @@ def table_header(width):
 def agent_line(a, now, width, prefix=""):
     status = a.display_status
     unconfirmed = a.is_unconfirmed(now)
+    stream_problem = a.has_stream_problem
     quiet = fmt_dur(now - (a.last_event or now)) if a.ended is None else "-"
     mode = ("main" if isinstance(a, MainAgent) else
             (("background" if column_widths(width)["mode"] >= 10 else "bg") if a.mode == "background" else "sync"))
@@ -1933,12 +2019,14 @@ def agent_line(a, now, width, prefix=""):
         tok = f"{a.in_tokens}/{a.out_tokens}" if a.tokens_known else ""
         if a.in_tokens or a.out_tokens:
             tok = f"{fmt_tokens(a.in_tokens)}/{fmt_tokens(a.out_tokens)}"
-    values = {"status": "~" if unconfirmed else STATUS_GLYPH.get(status, "?"), "started": fmt_timestamp(a.started),
+    values = {"status": "!" if stream_problem else ("~" if unconfirmed else STATUS_GLYPH.get(status, "?")),
+              "started": fmt_timestamp(a.started),
               "rt": fmt_dur(a.runtime(now)), "quiet": quiet, "id": a.short_id,
               "type": a.agent_type, "mode": mode, "model": a.model, "tools": a.tool_summary,
               "tok": tok, "aiu": fmt_aic(a.aic)}
     values["task"] = ({"waiting": "[approval] ", "input": "[INPUT] "}.get(status, "")) + a.label
-    return "unconfirmed" if unconfirmed else status, slice_cells(format_columns(values, width, prefix), max(0, width - 1))
+    style = "stream_error" if stream_problem else ("unconfirmed" if unconfirmed else status)
+    return style, slice_cells(format_columns(values, width, prefix), max(0, width - 1))
 
 
 def build_rows(mon: Monitor, rows, now, width):
@@ -1959,12 +2047,16 @@ def session_header(mon: Monitor, sid, kids, now, collapsed, width, main=None):
     if approvals:
         summary.append(f"{approvals} approval")
     if main is not None and main.display_status not in ("input", "waiting"):
-        summary.append(f"Main {'quiet' if main.is_unconfirmed(now) else main.display_status}")
+        summary.append(f"Main {'no signal' if main.is_unconfirmed(now) else main.display_status}")
     if kids:
         quiet = sum(k.is_unconfirmed(now) for k in kids)
         summary.append(f"{counts['running'] + counts['starting'] - quiet} {'sub active' if main is not None else 'active'}")
-        if quiet:
-            summary.append(f"{quiet} quiet")
+        stream_errors = sum(k.has_stream_problem for k in kids)
+        if stream_errors:
+            summary.append(f"{stream_errors} stream error")
+        quiet_only = sum(k.is_unconfirmed(now) and not k.has_stream_problem for k in kids)
+        if quiet_only:
+            summary.append(f"{quiet_only} no signal")
         if counts["idle"]:
             summary.append(f"{counts['idle']} idle")
         finished = sum(k.ended is not None for k in kids)
@@ -2035,6 +2127,11 @@ def footer_lines(mon: Monitor, width, sessions=None):
     if input_agents or input_sessions:
         lines.insert(0, clip(f"INPUT needed: {input_sessions} sessions, {input_agents} agents. "
                              "Answer in Copilot/VS Code; a:all reveals filtered entries.", width))
+    unavailable = [a for a in mon.agents.values() if a.has_stream_problem]
+    if unavailable:
+        ids = ", ".join(a.short_id for a in unavailable[:3])
+        lines.append(clip(f"VSC stream unavailable: {len(unavailable)} agent(s) ({ids}). "
+                          "a:all, Enter for details; recorded status is unchanged.", width))
     if mon.errors:
         lines.append(clip(f"Warning ({len(mon.errors)}): {mon.errors[-1]}", width))
     return lines
@@ -2115,6 +2212,8 @@ def table_row_style(kind, status, selected, use_color):
         return color | curses.A_BOLD | (curses.A_UNDERLINE if kind == "session" else 0)
     if selected:
         return (curses.color_pair(6) if use_color else curses.A_REVERSE) | curses.A_BOLD
+    if status == "stream_error":
+        return (curses.color_pair(2) if use_color else 0) | curses.A_BOLD
     if status == "unconfirmed":
         return (curses.color_pair(0) if use_color else 0) | curses.A_DIM
     if kind == "session":
@@ -2220,6 +2319,7 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                     "a: cycle activity - all / active (running+starting with an event within 5m) / last 2h",
                     "The 2h filter uses the last recorded event; d still controls finished entries.",
                     "~ dimmed: running/starting without an event within 5m, not proof of stopped work.",
+                    "! VSC stream error: subscription failed; see details. This is not an idle/failed task.",
                     "f: cycle session focus    /: search    Esc: clear search",
                     "r: rescan logs now    ?: help    q: back / quit",
                     f"Sources: {SOURCE_LABELS['cli']} CLI history, {SOURCE_LABELS['vscode']} VS Code AHP",
@@ -2442,6 +2542,8 @@ def agent_telemetry(agent, now):
         }
     if agent.last_error:
         fields["last_error"] = agent.last_error
+    if agent.stream_error is not None:
+        fields["telemetry"] = dict(agent.stream_error)
     if agent.display_status == "input":
         fields["input_wait"] = input_info(agent.inputs, now)
     return fields
@@ -2464,6 +2566,12 @@ def detail_entries(agent, now):
                      ("last main event", fmt_timestamp(agent.last_event, precise=True))])
     if agent.is_unconfirmed(now):
         info.append(("activity signal", "No event within 5 minutes; recorded status is unchanged."))
+    if agent.stream_error is not None:
+        error = agent.stream_error
+        info.append(("VSC event stream", "Unavailable: " + error["message"]))
+        if "error_code" in error:
+            info.append(("stream error code", str(error["error_code"])))
+        info.append(("stream error at", fmt_timestamp(error["at"], precise=True)))
     if agent.inputs:
         started = min(info["started"] for info in agent.inputs.values())
         info.append(("awaiting answer", f"{fmt_elapsed(max(0.0, now - started))}; answer in Copilot/VS Code"))

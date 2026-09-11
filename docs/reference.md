@@ -40,7 +40,7 @@ immediately and does not trigger an update check.
 
 The active filter requires a last event at or after the five-minute cutoff.
 It does not infer completion or delete older records. In broader views, dimmed
-`~` entries and the session summary's `quiet` count identify running/starting
+`~` entries and the session summary's `no signal` count identify running/starting
 records without a recent signal. Their JSON lifecycle status is unchanged.
 The JSON default remains `all`; opt into the active filter explicitly when needed.
 
@@ -88,6 +88,17 @@ These formats are implementation details that can change between versions.
 Public SDK schemas describe events, but optional or live-only events are not
 guaranteed to exist in every on-disk history. AHP subagent details can also depend
 on VS Code subscribing to the channel.
+
+For subagent `subscribe` requests, matched JSON-RPC error responses become
+per-agent stream diagnostics. Correlation uses the log file, connection ID and
+request ID; a response on a different connection is not evidence for that agent.
+`Resource not found` means the producer could not supply that requested VSC
+channel, not that the delegated task necessarily stopped.
+
+The monitor does not open or repair subscriptions itself. It observes existing
+traces and clears the diagnostic on newer success/channel events. Subagent
+streaming deltas are used as timestamp-only heartbeats; their payloads do not
+contribute additional tokens, tool calls or retained text.
 
 Further reading:
 
@@ -175,6 +186,7 @@ Optional telemetry objects:
 | `permissions` | Outstanding approvals, outcomes and recorded wait time |
 | `input_wait` | UTC `since` and elapsed `wait_seconds` for an unanswered request |
 | `last_error` | Latest recorded diagnostic |
+| `telemetry` | When a VSC subscription failed: source, unavailable state, error code/message and Unix `at` timestamp |
 
 New optional fields are omitted when unavailable. Some legacy numeric fields
 still use zero when no value was captured; inspect the optional usage objects

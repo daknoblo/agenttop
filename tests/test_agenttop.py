@@ -606,7 +606,7 @@ class ActivityFilterTests(unittest.TestCase):
         rows, _, _ = self.select("all")
         header = APP["session_header"](self.mon, "session-a", rows, self.now, set(), 200)
         self.assertIn("2 active", header)
-        self.assertIn("1 quiet", header)
+        self.assertIn("1 no signal", header)
 
     def test_old_input_and_approval_waits_are_not_dimmed_as_unconfirmed(self):
         agent = self.mon.agents["running-old"]

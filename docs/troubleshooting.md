@@ -115,6 +115,23 @@ Missing values are not estimates of zero. Open details, scroll through the
 available fields, and check `errors` in a JSON snapshot.
 See [usage accounting](reference.md#usage-accounting) for scope differences.
 
+### VS Code says "Working on it", but agenttop has no recent signal
+
+The UI can retain a pending-task label without delivering fresh subagent events.
+Look for a yellow `!` or the `VSC stream unavailable` footer message. Agent details
+show matched subscription failures, such as JSON-RPC `-32001: Resource not found`.
+
+That error means VS Code could not subscribe to the requested subagent channel.
+agenttop may only have the original launch acknowledgement, so it cannot confirm
+current work or report metrics that were never delivered. `no signal` is not
+the same as the SDK's explicit `idle` state.
+
+Open the subagent in VS Code to try subscribing to its details again. A successful
+retry clears the stream warning; actual new events restore activity visibility.
+If the error persists, investigate the VS Code/Copilot integration. Avoid
+reloading or restarting active sessions merely to change the monitor display.
+Use `--activity all` to keep the last known record visible in the meantime.
+
 ## Update stops
 
 `agenttop -update` and `agenttop --update` must be used alone.

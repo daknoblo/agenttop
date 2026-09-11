@@ -74,6 +74,10 @@ signal. This does not change their recorded status or prove that work has stoppe
 Incomplete subagent logs can also hide genuinely running work from the active view.
 Session sources are labeled **CLI** and **VSC**.
 
+A yellow `!` identifies a recorded VSC subagent-stream subscription error.
+Open details for the error code and time. This is a telemetry problem, not an
+idle or failed task; the five-minute filter and recorded lifecycle stay unchanged.
+
 Each matching session has a `Main:` row above its subagents. It shows the main
 agent's latest recorded activity, model and event time; `main` and `sub` counters
 are separate. Main-row AIC is shown only when direct main usage is known, never

@@ -37,7 +37,8 @@ when space permits, an activity summary and the session's AIC consumption.
 
 The summary counts the displayed agents: active means running or starting with
 an event in the last five minutes. Running/starting entries with no recent signal
-are counted as `quiet` when shown in a broader view.
+are counted as `no signal` when shown in a broader view. Known VSC subscription
+failures are counted separately as `stream error`.
 If no agents are displayed, the heading shows the session's own status.
 Select a group and press Enter to collapse or expand it.
 
@@ -114,6 +115,17 @@ In `all` or `2h`, a dimmed `~` means the last reported state is running/starting
 but no event was recorded within five minutes. This is an observation warning,
 not a new lifecycle state: JSON still reports the original state. Input and
 approval waits keep their attention colors, regardless of how long they wait.
+
+A yellow `!` means a VSC subagent-stream subscription failed. The footer points
+to affected agents even if the current filter hides them. Choose `a activity:all`
+and open the VSC agent's details to see the error code and timestamp.
+The recorded status can still be `running`; a missing stream does not establish
+that the agent is idle, stopped or failed.
+
+The warning clears when a later subscription succeeds or the channel delivers
+events. Successful subscription alone is not counted as work. Subagent text
+and tool-argument deltas refresh the activity timestamp without retaining the
+streamed text or adding token/tool counts.
 
 For `INPUT`, answer in the original chat. agenttop shows the wait but does not
 submit the response. Ordinary client-side tool execution is not automatically
