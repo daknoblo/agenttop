@@ -15,7 +15,7 @@ APP = runpy.run_path(str(Path(__file__).resolve().parents[1] / "agenttop"))
 class MainAgentTests(unittest.TestCase):
     def setUp(self):
         self.mon = APP["Monitor"]()
-        self.now = time.time()
+        self.now = float(int(time.time()))
         self.serial = 0
         self.sid = "example-session"
 
