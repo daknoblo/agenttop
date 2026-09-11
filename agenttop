@@ -1748,10 +1748,11 @@ class Monitor:
         rows.sort(key=keys.get(sort_key, keys["runtime"]))
         return rows, now
 
-    def select(self, show_done, sort_key, sess_filter=None, query="", activity="all"):
+    def select(self, show_done, sort_key, sess_filter=None, query="", activity="all", include_open_children=False):
         if activity not in ACTIVITY_FILTERS:
             raise ValueError(f"Unknown activity filter: {activity}")
         rows, now = self.snapshot(show_done, sort_key)
+        snapshot_rows = rows
         rows = [a for a in rows if activity_matches(a.display_status, a.last_event, now, activity)
                 and (activity != "active" or a.ended is None)]
         query = query.casefold()
@@ -1772,6 +1773,9 @@ class Monitor:
                 self.sessions[sid]["activity"],
             )).casefold()
         }
+        if activity == "active" and include_open_children:
+            rows = [a for a in snapshot_rows if a.ended is None
+                    and a.status not in ("done", "failed", "cancelled", "orphan")]
         rows = [a for a in rows if a.session in sessions and (
             a.session in matching or query in " ".join((
                 a.label, a.name, a.agent_id or a.call_id, a.agent_type, a.model,
@@ -2277,7 +2281,8 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                 mon.refresh()
                 last_poll = time.time()
 
-            rows, now, sessions = mon.select(show_done, current_sort, session_focus, search, current_activity)
+            rows, now, sessions = mon.select(show_done, current_sort, session_focus, search, current_activity,
+                                            include_open_children=True)
             mains = mon.main_views(sessions, show_done, current_activity, search, now)
             height, width = stdscr.getmaxyx()
             stdscr.erase()
@@ -2316,8 +2321,9 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                     "agenttop - local Copilot session and agent monitor",
                     "Up/Down, j/k: move    Enter: expand session / agent details",
                     "d: show/hide done, failed and cancelled    t: tree/flat    s: sort",
-                    "a: cycle activity - all / active (running+starting with an event within 5m) / last 2h",
+                    "a: cycle activity - all / active sessions (5m) with open subagents / last 2h",
                     "The 2h filter uses the last recorded event; d still controls finished entries.",
+                    "Active overview: open subagents of active sessions stay visible as context.",
                     "~ dimmed: running/starting without an event within 5m, not proof of stopped work.",
                     "! VSC stream error: subscription failed; see details. This is not an idle/failed task.",
                     "f: cycle session focus    /: search    Esc: clear search",
@@ -2326,9 +2332,9 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                     "Idle background agents can be resumed with write_agent.",
                     "STARTED is local date/time; agent details show seconds and UTC offset.",
                     "EXEC: background (bg) or blocking sync. MODEL: the language model used.",
-                    "Approval waits are excluded by 'active'; use 'all' or '2h' to see them.",
+                    "Open subagent context includes idle and waiting work; 'all' also reveals inactive sessions.",
                     "Magenta INPUT / keyboard symbol: answer needed in Copilot/VS Code.",
-                    "The INPUT badge includes hidden loaded sessions/agents; 'active' excludes input waits.",
+                    "The INPUT badge includes hidden loaded sessions/agents; use 'all' to reveal hidden waits.",
                     "AIC total sums loaded sessions once; 'known' means some session totals are missing.",
                     "Agent details: Up/Down, Page Up/Down, Home/End scroll through available telemetry.",
                     "Main rows show session-agent work; subagent counters exclude them.",
@@ -2702,7 +2708,8 @@ def main_record(main, now):
 def run_once(mon: Monitor, show_done: bool, sort_key: str, as_json: bool, tree=True, sess_filter=None, query="",
              activity="all"):
     mon.refresh()
-    rows, now, sessions = mon.select(show_done, sort_key, sess_filter, query, activity)
+    rows, now, sessions = mon.select(show_done, sort_key, sess_filter, query, activity,
+                                    include_open_children=not as_json)
     mains = mon.main_views(sessions, show_done, activity, query, now)
     if as_json:
         payload = {
@@ -2817,7 +2824,7 @@ def main(argv=None):
                           help="hide finished agents/sessions, including in JSON (default for TUI/text)")
     ap.set_defaults(show_done=None)
     ap.add_argument("--activity", choices=tuple(ACTIVITY_FILTERS),
-                    help="active: running/starting with an event within 5m (default; JSON: all); recent: last event within 2h")
+                    help="active: 5m activity plus open subagent context in TUI/text (default; JSON: all); recent: last event within 2h")
     ap.add_argument("--sort", default="runtime", choices=["runtime", "start", "idle", "status", "name"])
     ap.add_argument("--flat", action="store_true", help="flat list instead of the session tree")
     ap.add_argument("--session", metavar="ID", help="only show this session (id prefix)")

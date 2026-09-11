@@ -35,9 +35,10 @@ leading shell comments.
 
 ## No sessions or agents appear
 
-The default active view requires both a running/starting state and a captured
-event within five minutes. A running agent without a streamed event can therefore
-be absent; this does not mean it was stopped or removed.
+The default active view requires recent running/starting work in a session.
+Its open subagents are then shown even without fresh events of their own.
+If neither the main agent nor any subagent has a qualifying event within five
+minutes, the session can be absent; this does not mean its work was stopped.
 
 1. Cycle `a` to `all` and clear search with Escape.
 2. Cycle `f` back to all sessions.

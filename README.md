@@ -65,13 +65,15 @@ agenttop
 ```
 
 The default view combines both local sources and starts with `activity:active`:
-running/starting entries with an event in the last **five minutes**. Older
-entries are hidden, not deleted. Press `a` to select `all` and see the broader
-history. Sessions can appear before they have delegated any agents.
+sessions with running/starting work observed in the last **five minutes**.
+All open subagents of those sessions remain visible as context, including idle
+agents and entries without a fresh signal. Finished/failed/cancelled entries
+remain hidden in this view. Press `a` to select `all` for other sessions and
+`d` to include finished work.
 
-Under `all` or `2h`, a dimmed `~` marks running/starting entries without a recent
+Whenever shown, a dimmed `~` marks running/starting entries without a recent
 signal. This does not change their recorded status or prove that work has stopped.
-Incomplete subagent logs can also hide genuinely running work from the active view.
+An entirely quiet session can still be absent from the active view.
 Session sources are labeled **CLI** and **VSC**.
 
 A yellow `!` identifies a recorded VSC subagent-stream subscription error.
@@ -108,7 +110,8 @@ agenttop --json
 
 The [user guide](docs/usage.md) explains the display, filters, colors and detail view.
 JSON snapshots retain their full `activity:all` default; use
-`--json --activity active` to apply the same five-minute filter.
+`--json --activity active` for a strict five-minute query without the overview's
+additional context rows.
 
 ## Update
 

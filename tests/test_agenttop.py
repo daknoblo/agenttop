@@ -583,6 +583,34 @@ class ActivityFilterTests(unittest.TestCase):
             self.assertEqual(self.names("active", show_done),
                              {"running-recent", "starting"})
 
+    def test_active_overview_includes_all_open_children_of_active_session(self):
+        expected = {name for name, agent in self.mon.agents.items() if agent.ended is None}
+        self.assertEqual(self.names("active", include_open_children=True), expected)
+        self.assertEqual(self.names("active", True, include_open_children=True), expected)
+
+    def test_open_context_does_not_reactivate_inactive_sessions(self):
+        state = self.mon.sessions["session-a"]
+        state["main_last_event"] = self.now - 600
+        for agent in self.mon.agents.values():
+            if agent.status in ("running", "starting"):
+                agent.last_event = self.now - 600
+        self.assertEqual(self.names("active", include_open_children=True), set())
+        self.assertEqual(self.select("active", include_open_children=True)[2], set())
+
+    def test_fresh_child_keeps_other_open_children_visible(self):
+        self.mon.sessions["session-a"]["status"] = "idle"
+        self.mon.sessions["session-a"]["main_last_event"] = self.now - 600
+        self.assertIn("idle-old", self.names("active", include_open_children=True))
+        self.assertIn("running-old", self.names("active", include_open_children=True))
+
+    def test_open_context_respects_search_and_session_focus(self):
+        self.assertEqual(self.names("active", query="idle-old", include_open_children=True), {"idle-old"})
+        self.assertEqual(self.names("active", sess_filter="other-session", include_open_children=True), set())
+
+    def test_open_context_does_not_change_other_activity_modes(self):
+        for mode in ("all", "recent"):
+            self.assertEqual(self.names(mode, include_open_children=True), self.names(mode))
+
     def test_active_window_boundary_expiry_and_reappearance(self):
         agent = self.mon.agents["running-recent"]
         agent.last_event = self.now - 300
@@ -669,16 +697,16 @@ class ActivityFilterTests(unittest.TestCase):
         self.assertEqual(payload["counts"], {"running": 1, "starting": 1, "idle": 2, "done": 0, "waiting": 0, "input": 0})
         self.assertEqual(set(payload["sessions"]), {"session-a"})
 
-    def test_text_and_tree_use_same_selection(self):
+    def test_text_and_tree_include_open_context_consistently(self):
         for tree in (True, False):
             output = io.StringIO()
             with patch.object(self.mon, "refresh"), patch("time.time", return_value=self.now):
                 with contextlib.redirect_stdout(output):
                     APP["run_once"](self.mon, False, "name", False, tree=tree, activity="active")
             self.assertIn("activity:active finished:hide", output.getvalue())
-            self.assertNotIn("idle-recent", output.getvalue())
+            self.assertIn("idle-recent", output.getvalue())
             self.assertNotIn("cancelled-recent", output.getvalue())
-            self.assertNotIn("running-old", output.getvalue())
+            self.assertIn("running-old", output.getvalue())
             self.assertIn("running-recent", output.getvalue())
 
     def test_unconfirmed_style_does_not_change_json_status(self):
@@ -710,7 +738,7 @@ class ActivityFilterTests(unittest.TestCase):
             APP["main"]([])
         self.assertEqual(tui.call_args.kwargs["activity"], "active")
 
-    def test_real_cli_defaults_keep_only_fresh_work_but_json_keeps_history(self):
+    def test_real_cli_defaults_show_open_context_while_json_activity_remains_strict(self):
         now = time.time()
         events = []
         def event(kind, age, data, aid=None):
@@ -730,8 +758,8 @@ class ActivityFilterTests(unittest.TestCase):
             command = [sys.executable, str(Path(__file__).resolve().parents[1] / "agenttop"), "--log", str(log)]
             text = subprocess.check_output([*command, "--once"], text=True)
             self.assertIn("fresh-work", text)
-            self.assertNotIn("old-work", text)
-            self.assertNotIn("idle-work", text)
+            self.assertIn("old-work", text)
+            self.assertIn("idle-work", text)
             self.assertIn("CLI", text)
             payload = json.loads(subprocess.check_output([*command, "--json"], text=True))
             self.assertEqual({a["name"] for a in payload["agents"]}, {"old-work", "fresh-work", "idle-work"})
@@ -773,6 +801,7 @@ class ActivityFilterTests(unittest.TestCase):
         self.assertEqual([(call.args[0], call.args[4]) for call in selected.call_args_list],
                          [(False, "active"), (False, "recent"), (True, "recent"),
                           (True, "all"), (True, "active")])
+        self.assertTrue(all(call.kwargs["include_open_children"] for call in selected.call_args_list))
         footer = [call.args[2] for call in screen.addnstr.call_args_list if call.args[0] == 23]
         self.assertTrue(any("d finished:hide  a activity:active" in text for text in footer))
         self.assertTrue(any("d finished:show  a activity:2h" in text for text in footer))

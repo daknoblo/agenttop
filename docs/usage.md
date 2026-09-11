@@ -9,9 +9,10 @@ agenttop
 ```
 
 The default view combines local Copilot CLI and VS Code sources and starts with
-`activity:active`: only running/starting entries with a recorded event in the last
-five minutes. Entries age out of this view without being deleted or marked as
-finished. A new event can make them visible again.
+`activity:active`: sessions with running/starting work recorded in the last five
+minutes. The overview also includes all open subagents of those sessions, even
+when idle or without a recent signal. No entries are deleted or marked finished
+by filtering.
 
 [![Synthetic dashboard showing a task tree, an input request, an approval wait and completed tasks](images/overview.png)](images/overview.png)
 
@@ -111,7 +112,7 @@ The selected row is highlighted across its full width. Normal session headings
 are cyan and underlined. A group also turns magenta when a displayed child needs
 input, even if the group is collapsed.
 
-In `all` or `2h`, a dimmed `~` means the last reported state is running/starting,
+A dimmed `~` means the last reported state is running/starting,
 but no event was recorded within five minutes. This is an observation warning,
 not a new lifecycle state: JSON still reports the original state. Input and
 approval waits keep their attention colors, regardless of how long they wait.
@@ -143,7 +144,7 @@ The footer shows two independent filters:
 
 | Control | Values | Effect |
 | --- | --- | --- |
-| `a activity` | `active`, `2h`, `all` | Running/starting with a signal within five minutes; last event within two hours; no activity restriction |
+| `a activity` | `active`, `2h`, `all` | Active sessions plus open subagent context; last event within two hours; no activity restriction |
 | `d finished` | `hide`, `show` | Hide or include done, failed and cancelled entries |
 
 ```sh
@@ -153,10 +154,19 @@ agenttop --activity recent
 agenttop --activity recent --all-done
 ```
 
-`active` is the default for interactive and text views. It excludes idle,
-input-waiting and approval-waiting entries, and running/starting entries whose
-last event is older than five minutes or unavailable. The five-minute boundary
-is inclusive and advances with the clock. This uses log events, not CPU usage.
+`active` is the default for interactive and text views. A recent running/starting
+main agent or subagent makes a session eligible. All of its open subagents are
+then shown as context: idle, input/approval waits, stale running entries and
+stream warnings remain distinguishable by their actual states and colors.
+Showing a context row does not label that agent as currently working.
+
+Finished/failed/cancelled subagents are not added as active-view context.
+Use `all` or `2h` with `d finished:show` to inspect them. Entirely inactive sessions
+remain excluded. Search and session/source filters still apply.
+
+Main-agent rows continue to require their own recent running/starting signal.
+The five-minute boundary is inclusive and advances with the clock; it measures
+log events, not CPU usage.
 `2h` uses the last recorded event, not the start time, and can include idle work.
 Finished entries still require `d finished:show` or `--all-done`.
 The finished toggle does not override the activity filter.
@@ -253,8 +263,9 @@ Snapshot modes exit after one read. Redirected standard output also defaults
 to a text snapshot with the active filter; select `--json` explicitly for
 structured output. JSON retains `activity:all` and includes finished entries
 by default for compatibility with existing integrations. Use
-`--json --activity active` for the five-minute view, or `--hide-done` to exclude
-finished entries.
+`--json --activity active` for a strict five-minute query, without the extra open
+subagents shown as context in the TUI/text overview. Use `--hide-done` to exclude
+finished entries from broader JSON queries.
 
 See [JSON output](reference.md#json-output) for field definitions.
 

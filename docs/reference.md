@@ -17,7 +17,7 @@ agenttop --help
 | `--interval SECONDS` | `1` | Poll existing log files |
 | `--session ID` | All sessions | Filter by session ID prefix |
 | `--search TEXT` | No search | Case-insensitive session/task/model search |
-| `--activity all\|active\|recent` | `active` (JSON: `all`) | No activity restriction; running/starting with an event within five minutes; last event within two hours |
+| `--activity all\|active\|recent` | `active` (JSON: `all`) | No restriction; five-minute activity with open-child context in TUI/text; last event within two hours |
 | `--all-done` | On for JSON | Include finished, failed and cancelled entries |
 | `--hide-done` | On for TUI/text | Exclude terminal entries, including in JSON |
 | `--sort runtime\|start\|idle\|status\|name` | `runtime` | Initial ordering |
@@ -39,7 +39,12 @@ Directory discovery normally runs every five seconds. The `r` key forces it
 immediately and does not trigger an update check.
 
 The active filter requires a last event at or after the five-minute cutoff.
-It does not infer completion or delete older records. In broader views, dimmed
+TUI/text overviews additionally show all open subagents of sessions that qualify
+through their main agent or a subagent. These context rows still respect search
+and session filters, and never include finished/failed/cancelled entries.
+The JSON active query remains strict and does not add context rows.
+
+Filtering does not infer completion or delete older records. Dimmed
 `~` entries and the session summary's `no signal` count identify running/starting
 records without a recent signal. Their JSON lifecycle status is unchanged.
 The JSON default remains `all`; opt into the active filter explicitly when needed.
