@@ -17,7 +17,7 @@ agenttop --help
 | `--interval SECONDS` | `1` | Poll existing log files |
 | `--session ID` | All sessions | Filter by session ID prefix |
 | `--search TEXT` | No search | Case-insensitive session/task/model search |
-| `--activity all\|active\|recent` | `all` | All activity; running/starting only; last event within two hours |
+| `--activity all\|active\|recent` | `active` (JSON: `all`) | No activity restriction; running/starting with an event within five minutes; last event within two hours |
 | `--all-done` | On for JSON | Include finished, failed and cancelled entries |
 | `--hide-done` | On for TUI/text | Exclude terminal entries, including in JSON |
 | `--sort runtime\|start\|idle\|status\|name` | `runtime` | Initial ordering |
@@ -37,6 +37,12 @@ Use the update flag on its own.
 are not restricted by `--max-age`; `--source` still restricts the input format.
 Directory discovery normally runs every five seconds. The `r` key forces it
 immediately and does not trigger an update check.
+
+The active filter requires a last event at or after the five-minute cutoff.
+It does not infer completion or delete older records. In broader views, dimmed
+`~` entries and the session summary's `quiet` count identify running/starting
+records without a recent signal. Their JSON lifecycle status is unchanged.
+The JSON default remains `all`; opt into the active filter explicitly when needed.
 
 ## Event sources
 
@@ -64,6 +70,9 @@ Typical AHP trace locations:
 ~/.config/Code*/logs/<launch>/ahp/*.jsonl
 ~/AppData/Roaming/Code*/logs/<launch>/ahp/*.jsonl
 ```
+
+The UI labels these sources `CLI` and `VSC`; command-line values and JSON source
+values remain `cli` and `vscode`.
 
 For the same session ID, CLI history supplies lifecycle and usage while AHP
 can add repository metadata and UI input requests. This avoids counting the

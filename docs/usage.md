@@ -8,13 +8,14 @@
 agenttop
 ```
 
-The default view combines local Copilot CLI and VS Code sources, groups agents
-by session, and hides finished entries. New agents and events appear as logs
-are updated.
+The default view combines local Copilot CLI and VS Code sources and starts with
+`activity:active`: only running/starting entries with a recorded event in the last
+five minutes. Entries age out of this view without being deleted or marked as
+finished. A new event can make them visible again.
 
 [![Synthetic dashboard showing a task tree, an input request, an approval wait and completed tasks](images/overview.png)](images/overview.png)
 
-*This example has finished entries enabled. The actual TUI was captured with
+*This example has all activity and finished entries enabled. The actual TUI was captured with
 generated sessions in an isolated demo workspace and update checking disabled.*
 
 ## Read the overview
@@ -29,20 +30,22 @@ The badge includes targets hidden by display filters.
 
 ### Session groups
 
-A group heading contains the project/branch, source symbol, a short session ID
+A group heading contains the project/branch, source label, a short session ID
 when space permits, an activity summary and the session's AIC consumption.
 
-The summary counts the displayed agents: active means running or starting.
+The summary counts the displayed agents: active means running or starting with
+an event in the last five minutes. Running/starting entries with no recent signal
+are counted as `quiet` when shown in a broader view.
 If no agents are displayed, the heading shows the session's own status.
 Select a group and press Enter to collapse or expand it.
 
-Source symbols identify the recorded format, not necessarily the application
+Source labels identify the recorded format, not necessarily the application
 that launched the chat:
 
-| Symbol | Source |
+| Label | Source |
 | --- | --- |
-| `>_` | Copilot CLI-format session history |
-| White diamond (`U+25C7`) | VS Code AHP trace without a matching CLI history |
+| `CLI` | Copilot CLI-format session history |
+| `VSC` | VS Code AHP trace without a matching CLI history |
 
 VS Code can also produce CLI-format histories. For matching session IDs,
 agenttop prefers the CLI history and supplements it with AHP metadata and UI
@@ -93,6 +96,11 @@ The selected row is highlighted across its full width. Normal session headings
 are cyan and underlined. A group also turns magenta when a displayed child needs
 input, even if the group is collapsed.
 
+In `all` or `2h`, a dimmed `~` means the last reported state is running/starting,
+but no event was recorded within five minutes. This is an observation warning,
+not a new lifecycle state: JSON still reports the original state. Input and
+approval waits keep their attention colors, regardless of how long they wait.
+
 For `INPUT`, answer in the original chat. agenttop shows the wait but does not
 submit the response. Ordinary client-side tool execution is not automatically
 classified as a question.
@@ -109,18 +117,23 @@ The footer shows two independent filters:
 
 | Control | Values | Effect |
 | --- | --- | --- |
-| `a activity` | `all`, `active`, `2h` | No activity restriction; running/starting only; last event within two hours |
+| `a activity` | `active`, `2h`, `all` | Running/starting with a signal within five minutes; last event within two hours; no activity restriction |
 | `d finished` | `hide`, `show` | Hide or include done, failed and cancelled entries |
 
 ```sh
 agenttop --activity active
+agenttop --activity all --all-done
 agenttop --activity recent
 agenttop --activity recent --all-done
 ```
 
-`active` excludes idle, input-waiting and approval-waiting agents.
+`active` is the default for interactive and text views. It excludes idle,
+input-waiting and approval-waiting entries, and running/starting entries whose
+last event is older than five minutes or unavailable. The five-minute boundary
+is inclusive and advances with the clock. This uses log events, not CPU usage.
 `2h` uses the last recorded event, not the start time, and can include idle work.
 Finished entries still require `d finished:show` or `--all-done`.
+The finished toggle does not override the activity filter.
 
 To find a hidden input request, cycle `a` back to `all`. Its header badge remains
 visible even if the current filter excludes the row.
@@ -205,8 +218,11 @@ agenttop --json --activity recent --hide-done
 ```
 
 Snapshot modes exit after one read. Redirected standard output also defaults
-to a text snapshot; select `--json` explicitly for structured output.
-JSON includes finished entries by default unless hidden or filtered out.
+to a text snapshot with the active filter; select `--json` explicitly for
+structured output. JSON retains `activity:all` and includes finished entries
+by default for compatibility with existing integrations. Use
+`--json --activity active` for the five-minute view, or `--hide-done` to exclude
+finished entries.
 
 See [JSON output](reference.md#json-output) for field definitions.
 

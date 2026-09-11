@@ -10,8 +10,9 @@ tasks, activity and usage in one place.
 
 [![agenttop showing synthetic projects, a nested task, an approval wait and a question awaiting an answer](docs/images/overview.png)](docs/images/overview.png)
 
-*Real agenttop TUI, captured with generated demo sessions and finished agents
-enabled. Click the image to view it at full size. Colors depend on your terminal.*
+*Real agenttop TUI, captured with generated demo sessions, all activity and
+finished agents enabled. Click the image to view it at full size. Colors depend
+on your terminal.*
 
 ## What you can see
 
@@ -62,14 +63,21 @@ local checkouts and uninstalling.
 agenttop
 ```
 
-The default view combines both local sources and hides finished entries.
-Sessions can appear before they have delegated any agents.
+The default view combines both local sources and starts with `activity:active`:
+running/starting entries with an event in the last **five minutes**. Older
+entries are hidden, not deleted. Press `a` to select `all` and see the broader
+history. Sessions can appear before they have delegated any agents.
+
+Under `all` or `2h`, a dimmed `~` marks running/starting entries without a recent
+signal. This does not change their recorded status or prove that work has stopped.
+Incomplete subagent logs can also hide genuinely running work from the active view.
+Session sources are labeled **CLI** and **VSC**.
 
 | Key | Action |
 | --- | --- |
 | Up/Down or `j`/`k` | Select a session or agent |
 | Enter | Expand/collapse a session or open agent details |
-| `a` | Cycle all activity, running/starting only, and the last two hours |
+| `a` | Cycle active (5-minute signal), last two hours, and all activity |
 | `d` | Show/hide finished, failed and cancelled entries |
 | `/` | Search |
 | `f` | Cycle session focus |
@@ -81,6 +89,7 @@ Useful starting points:
 
 ```sh
 agenttop --activity active
+agenttop --activity all --all-done
 agenttop --activity recent --all-done
 agenttop --sort start
 agenttop --source cli
@@ -88,6 +97,8 @@ agenttop --json
 ```
 
 The [user guide](docs/usage.md) explains the display, filters, colors and detail view.
+JSON snapshots retain their full `activity:all` default; use
+`--json --activity active` to apply the same five-minute filter.
 
 ## Update
 

@@ -578,10 +578,44 @@ class ActivityFilterTests(unittest.TestCase):
     def names(self, activity, show_done=False, **kwargs):
         return {a.call_id for a in self.select(activity, show_done, **kwargs)[0]}
 
-    def test_active_means_only_running_and_starting_regardless_of_recency(self):
+    def test_active_requires_running_or_starting_and_recent_event(self):
         for show_done in (False, True):
             self.assertEqual(self.names("active", show_done),
-                             {"running-old", "running-recent", "starting"})
+                             {"running-recent", "starting"})
+
+    def test_active_window_boundary_expiry_and_reappearance(self):
+        agent = self.mon.agents["running-recent"]
+        agent.last_event = self.now - 300
+        self.assertIn(agent.call_id, self.names("active"))
+        self.now += 0.01
+        self.assertNotIn(agent.call_id, self.names("active"))
+        self.assertEqual(agent.status, "running")
+        self.assertIsNone(agent.ended)
+        self.assertIn(agent.call_id, self.names("all"))
+        agent.last_event = self.now
+        self.assertIn(agent.call_id, self.names("active"))
+        self.assertEqual(APP["ACTIVE_ACTIVITY_SECONDS"], 300)
+
+    def test_active_excludes_running_with_missing_event_time(self):
+        agent = self.mon.agents["unknown-time"]
+        agent.status = "running"
+        self.assertNotIn(agent.call_id, self.names("active"))
+        self.assertIn(agent.call_id, self.names("all"))
+
+    def test_session_counts_separate_recent_and_unconfirmed_work(self):
+        rows, _, _ = self.select("all")
+        header = APP["session_header"](self.mon, "session-a", rows, self.now, set(), 200)
+        self.assertIn("2 active", header)
+        self.assertIn("1 quiet", header)
+
+    def test_old_input_and_approval_waits_are_not_dimmed_as_unconfirmed(self):
+        agent = self.mon.agents["running-old"]
+        for field, status in (("inputs", "input"), ("permissions", "waiting")):
+            with self.subTest(status=status):
+                getattr(agent, field)["request"] = {"started": self.now - 1000, "kind": "shell"}
+                self.assertFalse(agent.is_unconfirmed(self.now))
+                self.assertEqual(APP["agent_line"](agent, self.now, 160)[0], status)
+                getattr(agent, field).clear()
 
     def test_recent_uses_last_event_including_exact_two_hour_boundary(self):
         self.assertEqual(self.names("recent"),
@@ -616,7 +650,7 @@ class ActivityFilterTests(unittest.TestCase):
                                  ("recent", "idle", 60), ("active", "running", 10800)):
             state = self.mon.state_for(sid, self.now - age)
             state["status"] = status
-        self.assertEqual(self.select("active")[2], {"session-a", "active"})
+        self.assertEqual(self.select("active")[2], {"session-a"})
         self.assertEqual(self.select("recent")[2], {"session-a", "recent"})
 
     def test_matching_child_keeps_finished_or_stale_session_visible(self):
@@ -644,7 +678,65 @@ class ActivityFilterTests(unittest.TestCase):
             self.assertIn("activity:active finished:hide", output.getvalue())
             self.assertNotIn("idle-recent", output.getvalue())
             self.assertNotIn("cancelled-recent", output.getvalue())
-            self.assertIn("running-old", output.getvalue())
+            self.assertNotIn("running-old", output.getvalue())
+            self.assertIn("running-recent", output.getvalue())
+
+    def test_unconfirmed_style_does_not_change_json_status(self):
+        import curses
+        agent = self.mon.agents["running-old"]
+        style, text = APP["agent_line"](agent, self.now, 160)
+        self.assertEqual(style, "unconfirmed")
+        self.assertTrue(text.startswith("~"))
+        self.assertEqual(agent.display_status, "running")
+        self.assertTrue(APP["table_row_style"]("agent", style, False, False) & curses.A_DIM)
+        output = io.StringIO()
+        with patch.object(self.mon, "refresh"), patch("time.time", return_value=self.now):
+            with contextlib.redirect_stdout(output):
+                APP["run_once"](self.mon, True, "name", True, activity="all")
+        row = next(a for a in json.loads(output.getvalue())["agents"] if a["call_id"] == agent.call_id)
+        self.assertEqual(row["status"], "running")
+        self.assertIn("activity signal", dict(APP["detail_entries"](agent, self.now)))
+
+    def test_normal_start_and_text_default_to_active_json_remains_all(self):
+        for args, expected in (([], "active"), (["--once"], "active"), (["--json"], "all"),
+                               (["--json", "--activity", "active"], "active"),
+                               (["--once", "--activity", "all"], "all")):
+            once = Mock()
+            with patch.dict(APP["main"].__globals__, run_once=once), patch.object(sys.stdout, "isatty", return_value=False):
+                APP["main"](args)
+            self.assertEqual(once.call_args.kwargs["activity"], expected)
+        tui = Mock()
+        with patch.dict(APP["main"].__globals__, run_tui=tui), patch.object(sys.stdout, "isatty", return_value=True):
+            APP["main"]([])
+        self.assertEqual(tui.call_args.kwargs["activity"], "active")
+
+    def test_real_cli_defaults_keep_only_fresh_work_but_json_keeps_history(self):
+        now = time.time()
+        events = []
+        def event(kind, age, data, aid=None):
+            value = {"type": kind, "id": f"event-{len(events)}", "data": data,
+                     "timestamp": datetime.fromtimestamp(now - age, timezone.utc).isoformat()}
+            if aid:
+                value["agentId"] = aid
+            events.append(value)
+        event("session.start", 700, {"sessionId": "example-defaults"})
+        for call, label, age in (("old", "old-work", 600), ("fresh", "fresh-work", 20), ("idle", "idle-work", 30)):
+            event("subagent.started", age, {"toolCallId": call, "agentDisplayName": label,
+                                             "executionMode": "background", "resumable": True}, call)
+        event("subagent.completed", 10, {"toolCallId": "idle"}, "idle")
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "events.jsonl"
+            log.write_text("".join(json.dumps(value) + "\n" for value in events))
+            command = [sys.executable, str(Path(__file__).resolve().parents[1] / "agenttop"), "--log", str(log)]
+            text = subprocess.check_output([*command, "--once"], text=True)
+            self.assertIn("fresh-work", text)
+            self.assertNotIn("old-work", text)
+            self.assertNotIn("idle-work", text)
+            self.assertIn("CLI", text)
+            payload = json.loads(subprocess.check_output([*command, "--json"], text=True))
+            self.assertEqual({a["name"] for a in payload["agents"]}, {"old-work", "fresh-work", "idle-work"})
+            active = json.loads(subprocess.check_output([*command, "--json", "--activity", "active"], text=True))
+            self.assertEqual([a["name"] for a in active["agents"]], ["fresh-work"])
 
     def test_cli_defaults_and_explicit_finished_options(self):
         for args, expected in ((["--json"], True), (["--once"], False),
@@ -671,7 +763,7 @@ class ActivityFilterTests(unittest.TestCase):
     def test_tui_keyboard_cycles_activity_and_toggles_finished(self):
         screen = Mock()
         screen.getmaxyx.return_value = (24, 160)
-        screen.get_wch.side_effect = ["a", "a", "d", "a", "q"]
+        screen.get_wch.side_effect = ["a", "d", "a", "a", "q"]
         with patch("curses.wrapper", side_effect=lambda callback: callback(screen)), \
                 patch("curses.has_colors", return_value=False), patch("curses.curs_set"), \
                 patch("curses.set_escdelay"), patch.object(self.mon, "refresh"), \
@@ -679,8 +771,8 @@ class ActivityFilterTests(unittest.TestCase):
                 patch.object(self.mon, "select", wraps=self.mon.select) as selected:
             APP["run_tui"](self.mon, 1, check_updates=False)
         self.assertEqual([(call.args[0], call.args[4]) for call in selected.call_args_list],
-                         [(False, "all"), (False, "active"), (False, "recent"),
-                          (True, "recent"), (True, "all")])
+                         [(False, "active"), (False, "recent"), (True, "recent"),
+                          (True, "all"), (True, "active")])
         footer = [call.args[2] for call in screen.addnstr.call_args_list if call.args[0] == 23]
         self.assertTrue(any("d finished:hide  a activity:active" in text for text in footer))
         self.assertTrue(any("d finished:show  a activity:2h" in text for text in footer))
@@ -804,12 +896,12 @@ class MonitorTests(unittest.TestCase):
         _, display = APP["build_display"](self.mon, rows, now, 240, True, set(), sessions)
         self.assertEqual(len(display), 1)
         self.assertEqual(display[0][0], "session")
-        self.assertTrue(display[0][3].startswith("\u25bc >_ "))
+        self.assertTrue(display[0][3].startswith("\u25bc CLI "))
         self.assertIn("project", display[0][3])
         self.assertEqual(self.mon.sessions["session-a"]["title"], "Build something useful")
 
-    def test_source_symbols_in_session_headers_and_text_not_json(self):
-        for source, glyph in (("cli", ">_"), ("vscode", "\u25c7")):
+    def test_source_labels_in_session_headers_and_text_not_json(self):
+        for source, glyph in (("cli", "CLI"), ("vscode", "VSC")):
             with self.subTest(source=source):
                 state = self.mon.state_for("session-a", self.now)
                 state["source"] = source

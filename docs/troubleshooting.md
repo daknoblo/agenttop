@@ -35,6 +35,10 @@ leading shell comments.
 
 ## No sessions or agents appear
 
+The default active view requires both a running/starting state and a captured
+event within five minutes. A running agent without a streamed event can therefore
+be absent; this does not mean it was stopped or removed.
+
 1. Cycle `a` to `all` and clear search with Escape.
 2. Cycle `f` back to all sessions.
 3. Press `d` to include finished work.
@@ -47,9 +51,9 @@ Chats hosted only on github.com are not a supported source.
 Under WSL, Windows and Linux use separate home directories:
 see [Windows-side logs](installation.md#windows-with-wsl).
 
-## VS Code is shown with a CLI source symbol
+## VS Code is shown with a CLI source label
 
-The symbol identifies the event format, not the launching application.
+The `CLI` / `VSC` label identifies the event format, not the launching application.
 VS Code can write CLI-format histories. For the same session ID, agenttop uses
 that history and supplements it with AHP metadata and UI input requests.
 Use `--source vscode` for an AHP-only view.
@@ -81,6 +85,8 @@ observed state. Verify the originating chat before assuming it is still waiting.
 
 ## Timing or consumption looks unexpected
 
+- A dimmed `~` in `all`/`2h` is running/starting without a recent event, not
+  confirmed idle or completed work. JSON retains the recorded lifecycle state.
 - Runtime is wall-clock time, not CPU usage. Resumable idle agents keep their
   original start time.
 - Quiet time measures the last recorded event, not process health.
