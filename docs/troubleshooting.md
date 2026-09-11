@@ -46,7 +46,8 @@ be absent; this does not mean it was stopped or removed.
 5. Press `r` to rediscover recently created files.
 6. Point `--log` at the exact history or log directory.
 
-The tree can show sessions without subagents; the flat view cannot.
+Both views can show main agents without subagents. The tree additionally shows
+session group headings and metadata-only sessions.
 Chats hosted only on github.com are not a supported source.
 Under WSL, Windows and Linux use separate home directories:
 see [Windows-side logs](installation.md#windows-with-wsl).
@@ -57,6 +58,18 @@ The `CLI` / `VSC` label identifies the event format, not the launching applicati
 VS Code can write CLI-format histories. For the same session ID, agenttop uses
 that history and supplements it with AHP metadata and UI input requests.
 Use `--source vscode` for an AHP-only view.
+
+## A session is working but no subagent is listed
+
+The session's main agent can read files, run tools and produce responses without
+delegating anything. Its work appears in the `Main:` row; delegated tasks appear
+underneath. Main activity and subagent activity are tracked separately.
+
+If only old delegation events exist, the five-minute filter can correctly hide
+those subagents while the main agent remains visible. Choose `--activity all`
+to inspect the older records. Fresh child events alone do not make a stale main
+agent appear active, and session-wide usage checkpoints are not treated as main
+work events.
 
 ## Interactive mode fails
 

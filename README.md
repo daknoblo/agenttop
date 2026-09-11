@@ -17,6 +17,7 @@ on your terminal.*
 ## What you can see
 
 - **Tasks first:** follow agent work in a session tree or a flat table.
+- **Main and subagents:** see the session's own work even when no subagent is running.
 - **Progress and timing:** start time, runtime, recent activity and completion state.
 - **Required input:** magenta questions and yellow approval waits stand out.
 - **Agent details:** models, configuration, tool results, timings and available final usage.
@@ -72,6 +73,11 @@ Under `all` or `2h`, a dimmed `~` marks running/starting entries without a recen
 signal. This does not change their recorded status or prove that work has stopped.
 Incomplete subagent logs can also hide genuinely running work from the active view.
 Session sources are labeled **CLI** and **VSC**.
+
+Each matching session has a `Main:` row above its subagents. It shows the main
+agent's latest recorded activity, model and event time; `main` and `sub` counters
+are separate. Main-row AIC is shown only when direct main usage is known, never
+copied from the session total.
 
 | Key | Action |
 | --- | --- |

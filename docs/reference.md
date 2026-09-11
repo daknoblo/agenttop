@@ -77,6 +77,8 @@ values remain `cli` and `vscode`.
 For the same session ID, CLI history supplies lifecycle and usage while AHP
 can add repository metadata and UI input requests. This avoids counting the
 same session's events twice.
+Different recorded session IDs remain separate even when their project names
+match; the monitor does not infer identity from a project label.
 
 Both formats are read incrementally. Partial lines are retried, rotation keeps
 the reconstructed state, and repeated event IDs/identical AHP records are
@@ -104,6 +106,7 @@ retain their names.
 | Session AIC | Reported cumulative session usage; already includes its subagents |
 | Observed agent AIC | Recorded per-request usage accumulated for that agent |
 | Final agent AIC | Authoritative `session.shutdown.agentMetrics` value |
+| Main-row AIC | Direct main usage only, with explicit `turn` or `session` scope; never the combined session total |
 | Observed context/output | Context observation and accumulated recorded output, not a final token total |
 | Reported total tokens | Latest completion summary or final input+output breakdown |
 | Tool timings | Start/completion timestamp differences for matched calls |
@@ -134,8 +137,10 @@ agenttop --json --activity recent --hide-done
 | `version` | Local checkout revision or standalone fingerprint |
 | `generated_at` | UTC snapshot timestamp |
 | `logs` | Input file paths, independent of display filters |
-| `counts` | Filtered agent counts: `running`, `starting`, `idle`, `done`, `waiting`, `input` |
-| `agents` | Filtered agent records |
+| `counts` | Filtered subagent counts: `running`, `starting`, `idle`, `done`, `waiting`, `input` |
+| `agents` | Filtered delegated-subagent records, unchanged by the main-row feature |
+| `main_counts` | Separate filtered counts for main agents |
+| `main_agents` | Filtered main-agent views of the session records |
 | `sessions` | Filtered session-ID-keyed records |
 | `errors` | Read/parse warnings |
 | `totals` | When known: `aic`, `complete` and `scope: "loaded_sessions"` |
@@ -144,6 +149,13 @@ agenttop --json --activity recent --hide-done
 `counts.done` includes failed and cancelled agents.
 `totals` and `attention` deliberately include loaded sessions hidden by filters.
 An empty `agents` array can coexist with visible session-only work.
+In that case, `main_agents` can contain the session's working main agent.
+
+Main-agent records contain the session ID, role, source, status, activity,
+model, last main-event timestamp, current-turn timing and observed tool counts.
+Known direct consumption appears as `usage.aic_self` with `scope` set to
+`turn` or `session`. Main input waits are counted once as session attention;
+they are not also inserted into the subagent registry.
 
 ### Agent records
 

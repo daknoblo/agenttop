@@ -24,6 +24,8 @@ generated sessions in an isolated demo workspace and update checking disabled.*
 
 The top line shows the running version, known AIC consumption and agent counts.
 The top-right corner shows the update-check result.
+`main N active` counts recently active main-agent rows. The `sub:` counters
+refer only to delegated subagents.
 
 An **`INPUT N`** badge means a loaded session or agent needs an answer.
 The badge includes targets hidden by display filters.
@@ -38,6 +40,17 @@ an event in the last five minutes. Running/starting entries with no recent signa
 are counted as `quiet` when shown in a broader view.
 If no agents are displayed, the heading shows the session's own status.
 Select a group and press Enter to collapse or expand it.
+
+A **`Main:` row** appears above the matching subagents whenever the main session
+has recorded activity that passes the filters. This is the agent doing the
+session's own work, not an additional delegation. Its latest activity can be a
+tool name or a recorded VS Code activity message. Child events alone do not
+refresh its activity clock.
+
+For a main row, `STARTED`/`RUNTIME` refer to the current user turn, `AGENT` shows
+the short session ID, `TYPE` and `EXEC` are `main`, and `TOKENS` shows the observed
+main context size. Enter opens its live details just like a subagent.
+Main rows also appear first in the flat view.
 
 Source labels identify the recorded format, not necessarily the application
 that launched the chat:
@@ -73,6 +86,7 @@ usage columns follow. Vertical separators retain the position of empty fields.
 
 `EXEC` and `MODEL` are independent: background describes how the agent runs,
 while the model describes which language model it uses.
+`EXEC main` identifies the session's main agent rather than a delegated task.
 
 Columns adapt to the window. Token/AIC columns appear from 132 columns, models
 from 160, and wider fields from 200. Less important columns are hidden when
@@ -164,7 +178,8 @@ agenttop --flat
 
 Press `s` to cycle runtime, start, quiet/idle time, status and name sorting.
 `start` shows the newest agents first. Press `t` to switch tree/flat view.
-The flat view contains agents only; session-only work remains visible in the tree.
+The flat view lists matching main agents first, followed by the sorted subagents,
+without group headings. The tree also retains session-only metadata rows.
 
 ## Inspect an agent
 
@@ -202,6 +217,11 @@ Some fields require the CLI history or a subscribed AHP subagent channel.
 
 Subagent usage is already included in session consumption, so it is not added
 again to the header total.
+
+Main-row AIC is direct main-agent consumption only: current-turn usage when
+reported by AHP, or session-wide main usage from a CLI shutdown report.
+Details label the scope as `AIC self/turn` or `AIC self/session`. If only a
+combined session total is known, the main-row AIC stays blank.
 
 `sum N` tokens are a reported input+output total, not context-window size.
 Cache and reasoning counts are not added again. The underlying AIC calculation

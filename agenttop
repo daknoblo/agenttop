@@ -435,6 +435,21 @@ def event_within(last_event, now, seconds):
     return last_event is not None and last_event >= now - seconds
 
 
+def activity_matches(status, last_event, now, activity):
+    if activity == "active":
+        return status in ("running", "starting") and event_within(last_event, now, ACTIVE_ACTIVITY_SECONDS)
+    if activity == "recent":
+        return event_within(last_event, now, RECENT_ACTIVITY_SECONDS)
+    if activity == "all":
+        return True
+    raise ValueError(f"Unknown activity filter: {activity}")
+
+
+def record_main_activity(state, ts):
+    if state["main_last_event"] is None or ts > state["main_last_event"]:
+        state["main_last_event"] = ts
+
+
 class Agent:
     __slots__ = (
         "call_id", "agent_id", "session", "name", "description", "agent_type", "model",
@@ -665,6 +680,63 @@ class Agent:
                 self.status = "orphan"
 
 
+class MainAgent(Agent):
+    """A live view of session state, never registered as a delegated subagent."""
+    __slots__ = ("monitor", "aic_scope")
+
+    def __init__(self, monitor, session):
+        self.monitor = monitor
+        self.aic_scope = None
+        super().__init__("main", session, None)
+        self.sync()
+
+    @property
+    def state(self):
+        return self.monitor.sessions[self.session]
+
+    @property
+    def label(self):
+        return f"Main: {self.state['activity'] or self.display_status}"
+
+    @property
+    def short_id(self):
+        return self.session[:8]
+
+    @property
+    def display_status(self):
+        return session_status(self.state)
+
+    def sync(self):
+        state = self.state
+        self.name, self.agent_type, self.mode = "Main agent", "main", "main"
+        self.description = state["activity"]
+        self.status, self.source, self.model = state["status"], state["source"], state["model"]
+        self.started = state["turn_started"]
+        self.ended = state["turn_done"] if self.status in ("done", "failed", "cancelled") else None
+        self.last_event = state["main_last_event"]
+        self.tools = state["tools"]
+        self.inputs, self.permissions = state["inputs"], state["permissions"]
+        self.in_tokens, self.out_tokens = state["in_tokens"], state["out_tokens"]
+        self.cached_tokens = state["cached_tokens"]
+        self.tokens_known = bool(self.in_tokens or self.out_tokens)
+        self.launched = True
+        self.final_aiu, self.aiu, self.aiu_known, self.aic_scope = None, 0.0, False, None
+        if state["status"] == "done" and state.get("session_direct_aiu_known"):
+            self.final_aiu = state["session_direct_aiu"]
+            self.aic_scope = "session"
+        elif state.get("direct_aiu_known"):
+            self.aiu = state["direct_aiu"]
+            self.aiu_known = True
+            self.aic_scope = "turn"
+        return self
+
+    def runtime(self, now):
+        if self.started is None:
+            return 0.0
+        end = self.state["turn_done"] if self.display_status not in ("running", "starting", "input", "waiting") else None
+        return max(0.0, (end if end is not None else now) - self.started)
+
+
 class Monitor:
     def __init__(self, targets=None, max_age_h=24.0, source="all", cli_dir=None):
         self.targets = targets
@@ -802,6 +874,8 @@ class Monitor:
         state["last_event"] = max(state["last_event"], ts)
         if owner:
             owner.last_event = ts
+        else:
+            record_main_activity(state, ts)
 
     def complete_input(self, sess, key, ts=None):
         primary = self.input_aliases.pop((sess, key), key)
@@ -817,6 +891,8 @@ class Monitor:
                 self.sessions[sess]["last_event"] = max(self.sessions[sess]["last_event"], ts)
                 if owner:
                     owner.last_event = ts
+                else:
+                    record_main_activity(self.sessions[sess], ts)
         self.input_aliases = {alias: target for alias, target in self.input_aliases.items()
                               if alias[0] != sess or target != primary}
 
@@ -924,6 +1000,8 @@ class Monitor:
             (owner.permissions if owner else state["permissions"])[request] = info
             if owner:
                 owner.last_event = ts
+            else:
+                record_main_activity(state, ts)
         else:
             pending = self.pending_permissions.pop(key, None)
             if pending is None:
@@ -938,6 +1016,8 @@ class Monitor:
                     owner.last_permission = f"{info['kind']}: {result}"
                 end = min(ts, owner.ended) if owner.ended is not None else ts
                 owner.permission_wait += max(0.0, end - info["started"])
+            else:
+                record_main_activity(state, ts)
 
     def feed_cli(self, line: str, sess: str):
         if not any(f'"{kind}"' in line for kind in CLI_EVENTS):
@@ -968,6 +1048,12 @@ class Monitor:
             owner = None
         raw_call = data.get("toolCallId")
         call = f"{sess}/{raw_call}" if isinstance(raw_call, str) else None
+        if kind == "tool.execution_complete":
+            owner = owner or self.tool_owners.get(call)
+        if (not aid and owner is None and not kind.startswith("subagent.")
+                and kind not in ("session.usage_checkpoint", "permission.requested", "permission.completed",
+                                 "user_input.requested", "user_input.completed")):
+            record_main_activity(state, ts)
 
         if kind == "subagent.configured" and aid:
             if owner:
@@ -1121,6 +1207,7 @@ class Monitor:
             if kind == "session.start":
                 state["session_direct_aiu"] = 0.0
             state["direct_aiu"] = None
+            state["direct_aiu_known"] = False
         elif kind == "session.model_change":
             state["model"] = data.get("newModel") or state["model"]
         elif kind == "user.message":
@@ -1131,8 +1218,10 @@ class Monitor:
             state["turn_aiu"] = 0.0
             state["turn_aiu_known"] = False
             state["direct_aiu"] = None
+            state["direct_aiu_known"] = False
             state["cli_direct_base"] = state["session_direct_aiu"]
             state["session_direct_aiu"] = None
+            state["session_direct_aiu_known"] = False
             state["turn_in"] = state["turn_out"] = state["turn_cached"] = 0
             state["status"] = "running"
         elif kind == "assistant.turn_start":
@@ -1149,9 +1238,11 @@ class Monitor:
             state["turn_aiu"] = max(0.0, state["session_aiu"] - state["cli_turn_base"])
             main_metrics = (data.get("agentMetrics") or {}).get("main") or {}
             direct = main_metrics.get("totalNanoAiu")
-            state["session_direct_aiu"] = nano_to_aiu(direct) if direct is not None else None
+            state["session_direct_aiu_known"] = is_metric(direct)
+            state["session_direct_aiu"] = nano_to_aiu(direct) if is_metric(direct) else None
             if state["session_direct_aiu"] is not None and state["cli_direct_base"] is not None:
                 state["direct_aiu"] = max(0.0, state["session_direct_aiu"] - state["cli_direct_base"])
+                state["direct_aiu_known"] = True
             # Checkpoints expose the latest prompt size without storing conversation text.
             for cache in data.get("promptCacheBreakState") or []:
                 if cache.get("conversation") != "main":
@@ -1259,10 +1350,13 @@ class Monitor:
                 self.clear_inputs(sess, before=ts)
             return
         state["last_event"] = max(state["last_event"], ts)
+        if kind != "session/metaChanged":
+            record_main_activity(state, ts)
 
         if kind == "chat/toolCallStart":
             if action.get("toolName"):
                 state["tools"][action["toolName"]] += 1
+                state["activity"] = action["toolName"]
             self.on_start(sess, action, ts)
             if action.get("toolCallId"):
                 self.input_tool_started(sess, action.get("toolName"), f"{sess}/{action['toolCallId']}", ts)
@@ -1282,6 +1376,7 @@ class Monitor:
             state["turn_done"] = None
             state["turn_aiu"] = state["direct_aiu"] = 0.0
             state["turn_aiu_known"] = False
+            state["direct_aiu_known"] = False
             state["turn_in"] = state["turn_cached"] = state["turn_out"] = 0
             msg = action.get("message") or {}
             if (msg.get("origin") or {}).get("kind") == "systemNotification":
@@ -1315,6 +1410,7 @@ class Monitor:
             "pending_tools": set(), "cli_turn_base": 0.0,
             "session_direct_aiu": None, "cli_direct_base": None,
             "session_aiu_known": False, "turn_aiu_known": False, "permissions": {}, "inputs": {},
+            "main_last_event": None, "direct_aiu_known": False, "session_direct_aiu_known": False,
         })
 
     @staticmethod
@@ -1326,6 +1422,7 @@ class Monitor:
         state["turn_aiu"] = max(state["turn_aiu"], nano_to_aiu(cu.get("totalNanoAiu")))
         state["session_aiu"] = max(state["session_aiu"], nano_to_aiu(cu.get("sessionTotalNanoAiu")))
         direct = (meta.get("directCopilotUsage") or {}).get("totalNanoAiu")
+        state["direct_aiu_known"] = state.get("direct_aiu_known", False) or is_metric(direct)
         state["direct_aiu"] = max(state["direct_aiu"] or 0.0, nano_to_aiu(direct))
         totals = meta.get("turnTokenTotals") or []
         if totals:
@@ -1569,15 +1666,7 @@ class Monitor:
         if activity not in ACTIVITY_FILTERS:
             raise ValueError(f"Unknown activity filter: {activity}")
         rows, now = self.snapshot(show_done, sort_key)
-        def matches(status, last_event):
-            if activity == "active":
-                return (status in ("running", "starting")
-                        and event_within(last_event, now, ACTIVE_ACTIVITY_SECONDS))
-            if activity == "recent":
-                return event_within(last_event, now, RECENT_ACTIVITY_SECONDS)
-            return True
-
-        rows = [a for a in rows if matches(a.display_status, a.last_event)
+        rows = [a for a in rows if activity_matches(a.display_status, a.last_event, now, activity)
                 and (activity != "active" or a.ended is None)]
         query = query.casefold()
         agent_sessions = {a.session for a in rows}
@@ -1585,13 +1674,16 @@ class Monitor:
             sid for sid, st in self.sessions.items()
             if (not sess_filter or sid.startswith(sess_filter))
             and (show_done or sid in agent_sessions or st["status"] not in ("done", "failed", "cancelled"))
-            and (sid in agent_sessions or matches(session_status(st), st["last_event"]))
+            and (sid in agent_sessions or activity_matches(
+                session_status(st), st["main_last_event"] if st["main_last_event"] is not None else st["last_event"],
+                now, activity))
         }
         matching = {
             sid for sid in sessions
             if not query or query in " ".join((
                 sid, self.session_label(sid), self.sessions[sid]["title"],
                 self.sessions[sid]["model"],
+                self.sessions[sid]["activity"],
             )).casefold()
         }
         rows = [a for a in rows if a.session in sessions and (
@@ -1600,6 +1692,23 @@ class Monitor:
             )).casefold()
         )]
         return rows, now, matching | {a.session for a in rows}
+
+    def main_views(self, sessions, show_done, activity, query, now):
+        result = []
+        for sid in sessions:
+            state = self.sessions[sid]
+            status = session_status(state)
+            if state["main_last_event"] is None:
+                continue
+            if not show_done and status in ("done", "failed", "cancelled"):
+                continue
+            if not activity_matches(status, state["main_last_event"], now, activity):
+                continue
+            if query and query.casefold() not in " ".join(
+                    (sid, self.session_label(sid), state["title"], state["activity"], state["model"])).casefold():
+                continue
+            result.append(MainAgent(self, sid))
+        return sorted(result, key=lambda main: -main.last_event)
 
     def counts(self, agents=None):
         now = time.time()
@@ -1813,8 +1922,11 @@ def agent_line(a, now, width, prefix=""):
     status = a.display_status
     unconfirmed = a.is_unconfirmed(now)
     quiet = fmt_dur(now - (a.last_event or now)) if a.ended is None else "-"
-    mode = ("background" if column_widths(width)["mode"] >= 10 else "bg") if a.mode == "background" else "sync"
-    if a.total_tokens is not None:
+    mode = ("main" if isinstance(a, MainAgent) else
+            (("background" if column_widths(width)["mode"] >= 10 else "bg") if a.mode == "background" else "sync"))
+    if isinstance(a, MainAgent):
+        tok = f"ctx {fmt_tokens(a.in_tokens)}" if a.in_tokens else ""
+    elif a.total_tokens is not None:
         tok = f"sum {fmt_tokens(a.total_tokens) if a.total_tokens else '0'}"
     else:
         tok = f"{a.in_tokens}/{a.out_tokens}" if a.tokens_known else ""
@@ -1833,7 +1945,7 @@ def build_rows(mon: Monitor, rows, now, width):
     return table_header(width), [agent_line(a, now, width) for a in rows]
 
 
-def session_header(mon: Monitor, sid, kids, now, collapsed, width):
+def session_header(mon: Monitor, sid, kids, now, collapsed, width, main=None):
     st = mon.sessions.get(sid, {})
     mark = "\u25bc" if sid not in collapsed else "\u25b6"
     status = session_status(st) if st else "unknown"
@@ -1845,9 +1957,11 @@ def session_header(mon: Monitor, sid, kids, now, collapsed, width):
         summary.append(f"{inputs} INPUT")
     if approvals:
         summary.append(f"{approvals} approval")
+    if main is not None and main.display_status not in ("input", "waiting"):
+        summary.append(f"Main {'quiet' if main.is_unconfirmed(now) else main.display_status}")
     if kids:
         quiet = sum(k.is_unconfirmed(now) for k in kids)
-        summary.append(f"{counts['running'] + counts['starting'] - quiet} active")
+        summary.append(f"{counts['running'] + counts['starting'] - quiet} {'sub active' if main is not None else 'active'}")
         if quiet:
             summary.append(f"{quiet} quiet")
         if counts["idle"]:
@@ -1925,14 +2039,19 @@ def footer_lines(mon: Monitor, width, sessions=None):
     return lines
 
 
-def build_display(mon: Monitor, rows, now, width, tree, collapsed, sessions=None):
+def build_display(mon: Monitor, rows, now, width, tree, collapsed, sessions=None, main_rows=None):
     """Return (header, items); each item is (kind, obj, status, text)."""
     header = table_header(width)
+    main_rows = main_rows or []
     if not tree:
-        return header, [("agent", a) + agent_line(a, now, width) for a in rows]
+        return header, ([("main", a) + agent_line(a, now, width) for a in main_rows]
+                        + [("agent", a) + agent_line(a, now, width) for a in rows])
 
     visible = {a.call_id for a in rows}
     grouped = {sid: [] for sid in sessions} if sessions is not None else {}
+    mains = {a.session: a for a in main_rows}
+    for sid in mains:
+        grouped.setdefault(sid, [])
     for a in rows:
         grouped.setdefault(a.session, []).append(a)
     order = sorted(grouped, key=lambda s: -(mon.sessions.get(s, {}).get("last_event") or 0))
@@ -1944,9 +2063,12 @@ def build_display(mon: Monitor, rows, now, width, tree, collapsed, sessions=None
         status = session_status(state) if state else "unknown"
         if any(k.display_status == "input" for k in kids):
             status = "input"
-        items.append(("session", sid, status, session_header(mon, sid, kids, now, collapsed, width)))
+        main = mains.get(sid)
+        items.append(("session", sid, status, session_header(mon, sid, kids, now, collapsed, width, main)))
         if sid in collapsed:
             continue
+        if main is not None:
+            items.append(("main", main) + agent_line(main, now, width))
         children = {}
         roots = []
         for a in kids:
@@ -2056,6 +2178,7 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                 last_poll = time.time()
 
             rows, now, sessions = mon.select(show_done, current_sort, session_focus, search, current_activity)
+            mains = mon.main_views(sessions, show_done, current_activity, search, now)
             height, width = stdscr.getmaxyx()
             stdscr.erase()
 
@@ -2066,7 +2189,8 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
             attention = f"INPUT {input_agents + input_sessions}" if input_agents or input_sessions else ""
             title = (f" agenttop {version()}{' | ' + attention if attention else ''}"
                      f"{' | ' + total if total else ''}  {datetime.now().strftime('%H:%M:%S')} ")
-            summary = (f" running {running}  starting {starting}  idle {idle}  done {done} "
+            main_active = sum(m.display_status in ("running", "starting") and not m.is_unconfirmed(now) for m in mains)
+            summary = (f" main {main_active} active | sub: running {running}  starting {starting}  idle {idle}  done {done} "
                        f" waiting {waiting}"
                        f"  | sessions {len(sessions)}  logs {len(mon.files)}  sort:{current_sort}"
                        f"{'  tree' if tree_mode else '  flat'}  activity:{ACTIVITY_FILTERS[current_activity]}"
@@ -2106,6 +2230,7 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
                     "The INPUT badge includes hidden loaded sessions/agents; 'active' excludes input waits.",
                     "AIC total sums loaded sessions once; 'known' means some session totals are missing.",
                     "Agent details: Up/Down, Page Up/Down, Home/End scroll through available telemetry.",
+                    "Main rows show session-agent work; subagent counters exclude them.",
                     "--source cli|vscode|all selects the log source at startup.",
                     "Only recorded events are shown; status is not a process health check.",
                     "Updates: checked at startup and every eight hours; --no-update-check disables.",
@@ -2120,7 +2245,7 @@ def run_tui(mon: Monitor, interval: float, tree=True, sess_filter=None, all_done
             elif detail is not None:
                 detail_limit = render_detail(stdscr, detail, height, width, detail_scroll)
             else:
-                header, body = build_display(mon, rows, now, width, tree_mode, collapsed, sessions)
+                header, body = build_display(mon, rows, now, width, tree_mode, collapsed, sessions, mains)
                 try:
                     header = pad_line(header, width - 1)
                     stdscr.addnstr(1, 0, header, len(header), curses.A_BOLD)
@@ -2322,6 +2447,8 @@ def agent_telemetry(agent, now):
 
 
 def detail_entries(agent, now):
+    if isinstance(agent, MainAgent):
+        agent.sync()
     info = [
         ("agent_id", agent.agent_id), ("call_id", agent.call_id),
         ("session", agent.session), ("source", agent.source),
@@ -2329,6 +2456,11 @@ def detail_entries(agent, now):
         ("type", agent.agent_type), ("model", agent.model),
         ("mode / status", f"{'background' if agent.mode == 'background' else 'sync'} / {agent.display_status}"),
     ]
+    if isinstance(agent, MainAgent):
+        info = [(key, value) for key, value in info if key not in ("agent_id", "call_id", "mode / status")]
+        info.extend([("role / status", f"Main agent / {agent.display_status}"),
+                     ("latest activity", agent.state["activity"]),
+                     ("last main event", fmt_timestamp(agent.last_event, precise=True))])
     if agent.is_unconfirmed(now):
         info.append(("activity signal", "No event within 5 minutes; recorded status is unchanged."))
     if agent.inputs:
@@ -2339,7 +2471,9 @@ def detail_entries(agent, now):
             f"{item['kind']} ({fmt_elapsed(max(0.0, now - item['started']))})"
             for item in agent.permissions.values())))
     if agent.aic is not None:
-        info.append(("AIC final" if agent.final_aiu is not None else "AIC observed", f"{agent.aic:.4f}"))
+        label = (f"AIC self/{agent.aic_scope}" if isinstance(agent, MainAgent) else
+                 ("AIC final" if agent.final_aiu is not None else "AIC observed"))
+        info.append((label, f"{agent.aic:.4f}"))
     if agent.total_tokens is not None:
         info.append(("tokens total", f"{agent.total_tokens:,}"))
     for key, value in agent.usage_totals.items():
@@ -2352,15 +2486,18 @@ def detail_entries(agent, now):
         if "duration_ms" in agent.completion:
             info.append(("reported duration", fmt_elapsed(agent.completion["duration_ms"] / 1000)))
     if agent.started is not None:
-        info.extend([("started", fmt_timestamp(agent.started, precise=True)),
-                     ("wall runtime", fmt_dur(agent.runtime(now)))])
+        info.extend([("turn started" if isinstance(agent, MainAgent) else "started",
+                      fmt_timestamp(agent.started, precise=True)),
+                     ("turn runtime" if isinstance(agent, MainAgent) else "wall runtime", fmt_dur(agent.runtime(now)))])
     if agent.ended is not None:
         info.append(("ended", fmt_timestamp(agent.ended, precise=True)))
     elif agent.last_event is not None:
         info.append(("quiet since", fmt_dur(now - agent.last_event)))
     for key, value in agent.configuration.items():
         info.append((key.replace("_", " "), str(value)))
-    if agent.tokens_known or agent.in_tokens or agent.out_tokens:
+    if isinstance(agent, MainAgent) and agent.in_tokens:
+        info.append(("context tokens", f"{agent.in_tokens:,}"))
+    elif not isinstance(agent, MainAgent) and (agent.tokens_known or agent.in_tokens or agent.out_tokens):
         info.append(("observed ctx/out", f"{agent.in_tokens:,} / {agent.out_tokens:,}"))
     if agent.cached_tokens:
         info.append(("observed cached", f"{agent.cached_tokens:,}"))
@@ -2427,10 +2564,37 @@ def render_detail(stdscr, agent, height, width, scroll=0):
     return maximum
 
 
+def main_view_counts(mains):
+    counts = collections.Counter(main.display_status for main in mains)
+    return {**{status: counts[status] for status in ("running", "starting", "idle", "waiting", "input")},
+            "done": sum(counts[status] for status in ("done", "failed", "cancelled"))}
+
+
+def main_record(main, now):
+    result = {
+        "session": main.session, "role": "main", "source": main.source,
+        "status": main.display_status, "activity": main.state["activity"], "model": main.model,
+        "turn_started_at": (datetime.fromtimestamp(main.started, timezone.utc).isoformat()
+                            if main.started is not None else None),
+        "last_event_at": datetime.fromtimestamp(main.last_event, timezone.utc).isoformat(),
+        "turn_runtime_seconds": round(main.runtime(now), 1),
+        "quiet_seconds": round(max(0.0, now - main.last_event), 1),
+        "tool_calls": dict(main.tools),
+    }
+    if main.aic is not None:
+        result["usage"] = {"aic_self": main.aic, "scope": main.aic_scope}
+    if main.in_tokens:
+        result["context_tokens"] = main.in_tokens
+    if main.display_status == "input":
+        result["input_wait"] = input_info(main.inputs, now)
+    return result
+
+
 def run_once(mon: Monitor, show_done: bool, sort_key: str, as_json: bool, tree=True, sess_filter=None, query="",
              activity="all"):
     mon.refresh()
     rows, now, sessions = mon.select(show_done, sort_key, sess_filter, query, activity)
+    mains = mon.main_views(sessions, show_done, activity, query, now)
     if as_json:
         payload = {
             "version": version(),
@@ -2440,6 +2604,8 @@ def run_once(mon: Monitor, show_done: bool, sort_key: str, as_json: bool, tree=T
                        "waiting": sum(a.display_status == "waiting" for a in rows),
                        "input": sum(a.display_status == "input" for a in rows)},
             "errors": mon.errors,
+            "main_agents": [main_record(main, now) for main in mains],
+            "main_counts": main_view_counts(mains),
             "agents": [
                 {
                     "agent_id": a.agent_id, "call_id": a.call_id, "session": a.session,
@@ -2498,11 +2664,12 @@ def run_once(mon: Monitor, show_done: bool, sort_key: str, as_json: bool, tree=T
     waiting = sum(a.display_status == "waiting" for a in rows)
     input_agents, input_sessions = mon.input_attention()
     attention = f" | INPUT {input_agents + input_sessions}" if input_agents or input_sessions else ""
+    main_active = sum(m.display_status in ("running", "starting") and not m.is_unconfirmed(now) for m in mains)
     print(f"agenttop {version()}{attention}{' | ' + total if total else ''}"
-          f"  running {running}  starting {starting}  idle {idle}  done {done}  waiting {waiting}"
+          f"  main {main_active} active | sub: running {running}  starting {starting}  idle {idle}  done {done}  waiting {waiting}"
           f"  | sessions {len(sessions)}  logs {len(mon.files)}"
           f"  | activity:{ACTIVITY_FILTERS[activity]} finished:{'show' if show_done else 'hide'}")
-    header, body = build_display(mon, rows, now, width, tree, set(), sessions)
+    header, body = build_display(mon, rows, now, width, tree, set(), sessions, mains)
     print(header)
     for _kind, _obj, _status, text in body:
         print(text)

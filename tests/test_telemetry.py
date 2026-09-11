@@ -350,7 +350,7 @@ class TelemetryTests(unittest.TestCase):
         self.feed("session.usage_checkpoint", {"totalNanoAiu": 10_000_000_000})
         screen = Mock()
         screen.getmaxyx.return_value = (12, 160)
-        screen.get_wch.side_effect = ["j", "\n", curses.KEY_END, "q", "q"]
+        screen.get_wch.side_effect = ["j", "j", "\n", curses.KEY_END, "q", "q"]
         with patch("curses.wrapper", side_effect=lambda callback: callback(screen)), \
                 patch("curses.has_colors", return_value=False), patch("curses.curs_set"), \
                 patch("curses.set_escdelay"), patch.object(self.mon, "refresh"):
